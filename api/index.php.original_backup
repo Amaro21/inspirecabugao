@@ -1,0 +1,1068 @@
+<?php
+// Prevent any stray output before headers
+ob_start();
+
+require_once '../config.php';
+
+// ── Headers ──────────────────────────────────────────────
+header('Content-Type: application/json; charset=utf-8');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, X-Requested-With');
+
+// Handle OPTIONS preflight
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit; }
+
+// ── Input helper ─────────────────────────────────────────
+// Accepts JSON body OR regular POST form data
+function body() {
+    $raw = file_get_contents('php://input');
+    if ($raw) {
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) return $decoded;
+    }
+    return $_POST ?: [];
+}
+
+// ── Google reCAPTCHA verification ────────────────────────
+// Uses cURL when available (more reliable on shared hosts that disable
+// allow_url_fopen), falling back to file_get_contents otherwise.
+function verifyRecaptcha($token, $remoteIp) {
+    $params = [
+        'secret'   => RECAPTCHA_SECRET_KEY,
+        'response' => $token,
+        'remoteip' => $remoteIp,
+    ];
+    $response = null;
+    if (function_exists('curl_init')) {
+        $ch = curl_init('https://www.google.com/recaptcha/api/siteverify');
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($params));
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+        $response = curl_exec($ch);
+        curl_close($ch);
+    }
+    if (!$response) {
+        $response = @file_get_contents('https://www.google.com/recaptcha/api/siteverify?' . http_build_query($params));
+    }
+    if (!$response) return false;
+    $result = json_decode($response, true);
+    return !empty($result['success']);
+}
+
+// ── Safe mail sending ─────────────────────────────────────
+// Tries real Gmail SMTP delivery first (reliable — actually reaches
+// inboxes), falling back to PHP's built-in mail() if no Gmail SMTP
+// credentials are configured. Either way, this function can NEVER crash
+// the request — password reset, account creation, etc. always succeed
+// from the user's perspective even if the email itself fails to send.
+function safeSendMail($to, $subject, $body, $fromName = APP_NAME) {
+    try {
+        if (!empty(GMAIL_SMTP_USER) && !empty(GMAIL_SMTP_APP_PASSWORD)) {
+            $ok = sendViaGmailSMTP($to, $subject, $body, $fromName);
+            if ($ok) return true;
+        }
+    } catch (Throwable $e) {
+        // fall through to mail() below
+    }
+    // Fallback: PHP's built-in mail() — swap out the error handler for the
+    // duration of the call so a failure (e.g. no local mail server) can
+    // never surface as a crash, regardless of @ suppression edge cases.
+    $previousHandler = set_error_handler(function() { return true; });
+    try {
+        $headers = "From: $fromName <no-reply@" . ($_SERVER['HTTP_HOST'] ?? 'localhost') . ">\r\n";
+        @mail($to, $subject, $body, $headers);
+    } catch (Throwable $e) {
+        // Ignore — sending the email is best-effort only.
+    } finally {
+        set_error_handler($previousHandler);
+    }
+    return false;
+}
+
+// Minimal hand-rolled SMTP client for sending through Gmail's servers.
+// No external library needed — just raw sockets + STARTTLS + AUTH LOGIN.
+function sendViaGmailSMTP($to, $subject, $body, $fromName) {
+    $host = 'smtp.gmail.com';
+    $port = 587;
+    $user = GMAIL_SMTP_USER;
+    $pass = GMAIL_SMTP_APP_PASSWORD;
+
+    $sock = @stream_socket_client("tcp://$host:$port", $errno, $errstr, 10);
+    if (!$sock) return false;
+    stream_set_timeout($sock, 10);
+
+    $read = function($s) {
+        $data = '';
+        while ($line = fgets($s, 515)) {
+            $data .= $line;
+            if (substr($line, 3, 1) === ' ') break; // last line of a multi-line response
+        }
+        return $data;
+    };
+    $write = function($s, $cmd) { fwrite($s, $cmd . "\r\n"); };
+
+    $read($sock); // server greeting
+    $write($sock, "EHLO inspirecabugao");
+    $read($sock);
+    $write($sock, "STARTTLS");
+    $resp = $read($sock);
+    if (strpos($resp, '220') !== 0) { fclose($sock); return false; }
+
+    if (!stream_socket_enable_crypto($sock, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
+        fclose($sock);
+        return false;
+    }
+
+    $write($sock, "EHLO inspirecabugao");
+    $read($sock);
+    $write($sock, "AUTH LOGIN");
+    $read($sock);
+    $write($sock, base64_encode($user));
+    $read($sock);
+    $write($sock, base64_encode($pass));
+    $resp = $read($sock);
+    if (strpos($resp, '235') !== 0) { fclose($sock); return false; } // auth failed
+
+    $write($sock, "MAIL FROM:<$user>");
+    $read($sock);
+    $write($sock, "RCPT TO:<$to>");
+    $resp = $read($sock);
+    if (strpos($resp, '250') !== 0) { fclose($sock); return false; }
+
+    $write($sock, "DATA");
+    $read($sock);
+
+    // Escape lines that start with a lone "." per SMTP DATA rules
+    $escapedBody = preg_replace('/^\./m', '..', $body);
+    $headers = "From: $fromName <$user>\r\n"
+             . "To: <$to>\r\n"
+             . "Subject: $subject\r\n"
+             . "Date: " . date('r') . "\r\n"
+             . "MIME-Version: 1.0\r\n"
+             . "Content-Type: text/plain; charset=UTF-8\r\n";
+    $write($sock, $headers . "\r\n" . $escapedBody . "\r\n.");
+    $resp = $read($sock);
+    $write($sock, "QUIT");
+    fclose($sock);
+
+    return strpos($resp, '250') === 0;
+}
+
+// ── Activity logging (non-repudiation audit trail) ───────
+// Snapshots the acting user's identity at the moment of the action, so the
+// record stays accurate even if that account is later renamed or deleted.
+function logActivity($action, $description, $targetType = null, $targetId = null, $overrideUser = null) {
+    try {
+        $u  = $overrideUser ?? currentUser();
+        $db = getDB();
+        $db->prepare("INSERT INTO activity_logs (user_id, username, full_name, role, action, description, target_type, target_id, ip_address) VALUES (?,?,?,?,?,?,?,?,?)")
+           ->execute([
+               $u['id'] ?? null,
+               $u['username'] ?? null,
+               $u['full_name'] ?? null,
+               $u['role'] ?? null,
+               $action,
+               $description,
+               $targetType,
+               $targetId,
+               $_SERVER['REMOTE_ADDR'] ?? null,
+           ]);
+    } catch (Exception $e) {
+        // Never let a logging failure break the actual request
+    }
+}
+
+// ── Global error handler → always return JSON ────────────
+set_exception_handler(function($e) {
+    ob_clean();
+    http_response_code(500);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['error' => $e->getMessage()]);
+    exit;
+});
+set_error_handler(function($errno, $errstr) {
+    // Respect the @ suppression operator (e.g. @mail()) — when a statement is
+    // prefixed with @, PHP temporarily sets error_reporting to 0 for it.
+    // Without this check, suppressed warnings still crashed the whole request.
+    if (error_reporting() === 0) return false;
+    throw new ErrorException($errstr, $errno);
+});
+
+$action = trim($_GET['action'] ?? '');
+
+
+// Calculate age group from birth_date
+function calcAgeGroup($birth_date) {
+    if (!$birth_date) return 'adult';
+    $age = (int)date_diff(date_create($birth_date), date_create('today'))->y;
+    if ($age <= 11) return 'child';
+    if ($age >= 60) return 'senior';
+    return 'adult';
+}
+
+switch ($action) {
+
+// ===================== AUTH =====================
+case 'login':
+    $d = body();
+    $username = trim($d['username'] ?? '');
+    $password = $d['password'] ?? '';
+
+    if (empty($username) || empty($password)) {
+        jsonResponse(['error' => 'Username and password are required.'], 400);
+    }
+
+    $db = getDB();
+    $st = $db->prepare("SELECT * FROM users WHERE username = ? AND is_active = 1");
+    $st->execute([$username]);
+    $u = $st->fetch();
+
+    $valid = false;
+    if ($u) {
+        $stored = $u['password'] ?? '';
+        if (!empty($stored) && password_verify($password, $stored)) {
+            $valid = true;
+        } elseif (empty($stored) && !empty($password)) {
+            // First-time login with empty hash — set it now
+            $hash = password_hash($password, PASSWORD_DEFAULT);
+            $db->prepare("UPDATE users SET password = ? WHERE id = ?")->execute([$hash, $u['id']]);
+            $valid = true;
+        }
+    }
+
+    if ($valid) {
+        $_SESSION['user'] = [
+            'id'        => $u['id'],
+            'username'  => $u['username'],
+            'full_name' => $u['full_name'],
+            'role'      => $u['role'],
+            'email'     => $u['email'] ?? '',
+        ];
+        logActivity('login', "Logged in.", 'user', $u['id']);
+        jsonResponse(['success' => true, 'user' => $_SESSION['user']]);
+    }
+
+    jsonResponse(['error' => 'Invalid username or password.'], 401);
+
+case 'logout':
+    logActivity('logout', 'Logged out.', 'user', currentUser()['id'] ?? null);
+    session_destroy();
+    jsonResponse(['success' => true]);
+
+case 'update_profile':
+    if (!isLoggedIn()) jsonResponse(['error' => 'Not logged in.'], 401);
+    $d = body();
+    $fullName = trim($d['full_name'] ?? '');
+    $email    = trim($d['email'] ?? '');
+    if (empty($fullName)) jsonResponse(['error' => 'Full name is required.'], 400);
+    if (!empty($email) && !preg_match('/^[^\s@]+@gmail\.com$/i', $email)) {
+        jsonResponse(['error' => 'Please provide a valid Gmail address (must end in @gmail.com).'], 400);
+    }
+    $db  = getDB();
+    $uid = currentUser()['id'];
+    if (!empty($email)) {
+        $st = $db->prepare("SELECT id FROM users WHERE email = ? AND id != ?");
+        $st->execute([$email, $uid]);
+        if ($st->fetch()) jsonResponse(['error' => 'That Gmail address is already linked to another account.'], 409);
+    }
+    $db->prepare("UPDATE users SET full_name = ?, email = ? WHERE id = ?")
+       ->execute([$fullName, $email ?: null, $uid]);
+    // Refresh the session copy so the new name/email show immediately
+    $_SESSION['user']['full_name'] = $fullName;
+    $_SESSION['user']['email'] = $email;
+    logActivity('update_profile', "Updated own profile (name: $fullName).", 'user', $uid);
+    jsonResponse(['success' => true, 'user' => $_SESSION['user']]);
+
+case 'change_password':
+    if (!isLoggedIn()) jsonResponse(['error' => 'Not logged in.'], 401);
+    $d = body();
+    $current = $d['current_password'] ?? '';
+    $new     = $d['new_password'] ?? '';
+    if (empty($current) || empty($new)) {
+        jsonResponse(['error' => 'Current and new password are required.'], 400);
+    }
+    if (strlen($new) < 6) {
+        jsonResponse(['error' => 'New password must be at least 6 characters.'], 400);
+    }
+    $db  = getDB();
+    $uid = currentUser()['id'];
+    $st  = $db->prepare("SELECT * FROM users WHERE id = ?");
+    $st->execute([$uid]);
+    $u = $st->fetch();
+    if (!$u || !password_verify($current, $u['password'] ?? '')) {
+        jsonResponse(['error' => 'Current password is incorrect.'], 400);
+    }
+    $hash = password_hash($new, PASSWORD_DEFAULT);
+    $db->prepare("UPDATE users SET password = ? WHERE id = ?")->execute([$hash, $uid]);
+    logActivity('change_password', 'Changed own password.', 'user', $uid);
+    jsonResponse(['success' => true]);
+
+case 'forgot_password':
+    $d = body();
+    $username = trim($d['username'] ?? '');
+    $email    = trim($d['email'] ?? '');
+    if (empty($username) || empty($email)) {
+        jsonResponse(['error' => 'Username and Gmail address are required.'], 400);
+    }
+    $db = getDB();
+    $st = $db->prepare("SELECT * FROM users WHERE username = ? AND email = ? AND is_active = 1");
+    $st->execute([$username, $email]);
+    $u = $st->fetch();
+    // Always respond the same way whether or not a match was found, so this
+    // endpoint can't be used to discover valid usernames/emails.
+    if ($u) {
+        $token   = bin2hex(random_bytes(32));
+        $expires = date('Y-m-d H:i:s', time() + 3600); // 1 hour
+        $db->prepare("UPDATE users SET reset_token = ?, reset_expires = ? WHERE id = ?")
+           ->execute([$token, $expires, $u['id']]);
+
+        // This script lives in /api/index.php, so we need to go up ONE more
+        // directory level than dirname() alone gives us, to land back at the
+        // actual app root (where the real index.php lives).
+        $appRoot = dirname(dirname($_SERVER['PHP_SELF']));
+        $resetLink = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' ? 'https://' : 'http://')
+                   . $_SERVER['HTTP_HOST'] . $appRoot . '/index.php?reset_token=' . $token;
+        $subject = 'INSPIRE Cabugao — Password Reset Request';
+        $body    = "Hi {$u['full_name']},\n\nA password reset was requested for your INSPIRE admin account (username: {$u['username']}).\n\n"
+                 . "Click the link below to set a new password. This link expires in 1 hour:\n{$resetLink}\n\n"
+                 . "If you did not request this, you can safely ignore this email.\n\n— INSPIRE Cabugao";
+        safeSendMail($email, $subject, $body, 'INSPIRE Cabugao');
+        logActivity('forgot_password_request', "Requested a password reset link.", 'user', $u['id'], $u);
+    }
+    jsonResponse(['success' => true]);
+
+case 'reset_password_confirm':
+    $d = body();
+    $token = trim($d['token'] ?? '');
+    $new   = $d['new_password'] ?? '';
+    if (empty($token) || empty($new)) {
+        jsonResponse(['error' => 'Invalid request.'], 400);
+    }
+    if (strlen($new) < 6) {
+        jsonResponse(['error' => 'New password must be at least 6 characters.'], 400);
+    }
+    $db = getDB();
+    $st = $db->prepare("SELECT * FROM users WHERE reset_token = ? AND reset_expires >= NOW()");
+    $st->execute([$token]);
+    $u = $st->fetch();
+    if (!$u) {
+        jsonResponse(['error' => 'This reset link is invalid or has expired. Please request a new one.'], 400);
+    }
+    $hash = password_hash($new, PASSWORD_DEFAULT);
+    $db->prepare("UPDATE users SET password = ?, reset_token = NULL, reset_expires = NULL WHERE id = ?")
+       ->execute([$hash, $u['id']]);
+    logActivity('reset_password_confirm', 'Reset password via emailed link.', 'user', $u['id'], $u);
+    jsonResponse(['success' => true]);
+
+case 'me':
+    jsonResponse(['user' => currentUser(), 'logged_in' => isLoggedIn()]);
+
+case 'app_config':
+    // Public, no auth — only ever exposes the reCAPTCHA *site* key (not secret),
+    // which is meant to be public anyway.
+    jsonResponse(['recaptcha_site_key' => RECAPTCHA_SITE_KEY]);
+
+// Public self-registration removed — staff accounts are created by the
+// Super Admin via the Admin Dashboard → Users tab (see 'user_create').
+
+// ===================== STATS =====================
+case 'stats':
+    $db = getDB();
+    jsonResponse([
+        'population' => (int)$db->query("SELECT COUNT(*) FROM members")->fetchColumn(),
+        'houses'     => (int)$db->query("SELECT COUNT(*) FROM houses")->fetchColumn(),
+        'streets'    => (int)$db->query("SELECT COUNT(*) FROM streets")->fetchColumn(),
+        'facilities' => (int)$db->query("SELECT COUNT(*) FROM facilities")->fetchColumn(),
+        'incidents'  => isOfficial()
+            ? (int)$db->query("SELECT COUNT(*) FROM incidents WHERE approved=0 AND status!='closed'")->fetchColumn()
+            : (int)$db->query("SELECT COUNT(*) FROM incidents WHERE lat IS NOT NULL AND approved=1 AND status != 'closed' AND approved_at >= DATE_SUB(NOW(), INTERVAL 12 HOUR)")->fetchColumn(),
+        'adults'     => (int)$db->query("SELECT COUNT(*) FROM members WHERE age_group='adult'")->fetchColumn(),
+        'children'   => (int)$db->query("SELECT COUNT(*) FROM members WHERE age_group='child'")->fetchColumn(),
+        'seniors'    => (int)$db->query("SELECT COUNT(*) FROM members WHERE age_group='senior'")->fetchColumn(),
+        'pwd'        => (int)$db->query("SELECT COUNT(*) FROM members WHERE is_pwd=1")->fetchColumn(),
+        'males'      => (int)$db->query("SELECT COUNT(*) FROM members WHERE gender='male'")->fetchColumn(),
+        'females'    => (int)$db->query("SELECT COUNT(*) FROM members WHERE gender='female'")->fetchColumn(),
+    ]);
+
+// ===================== STREETS =====================
+case 'streets':
+    $db = getDB();
+    $rows = $db->query("
+        SELECT s.*, COUNT(DISTINCT h.id) house_count, COUNT(m.id) population,
+               SUM(m.gender='male') males, SUM(m.gender='female') females,
+               SUM(m.age_group='child') children, SUM(m.age_group='senior') seniors,
+               SUM(m.is_pwd=1) pwd_count
+        FROM streets s
+        LEFT JOIN puroks p ON p.street_id = s.id
+        LEFT JOIN houses h ON h.purok_id = p.id
+        LEFT JOIN members m ON m.house_id = h.id
+        GROUP BY s.id ORDER BY s.name
+    ")->fetchAll();
+    jsonResponse($rows);
+
+case 'puroks':
+    $db = getDB();
+    $rows = $db->query("
+        SELECT p.*, st.name street_name,
+               COUNT(DISTINCT h.id) house_count,
+               COUNT(m.id) population
+        FROM puroks p
+        JOIN streets st ON st.id = p.street_id
+        LEFT JOIN houses h ON h.purok_id = p.id
+        LEFT JOIN members m ON m.house_id = h.id
+        GROUP BY p.id ORDER BY st.name, p.name
+    ")->fetchAll();
+    jsonResponse($rows);
+
+case 'purok_add':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized — officials only.'], 401);
+    $d = body();
+    if (empty(trim($d['name'] ?? '')) || empty($d['street_id'])) {
+        jsonResponse(['error' => 'Purok name and parent street are required.'], 400);
+    }
+    $db = getDB();
+    $lat = isset($d['lat']) && $d['lat'] !== '' ? (float)$d['lat'] : null;
+    $lng = isset($d['lng']) && $d['lng'] !== '' ? (float)$d['lng'] : null;
+    $db->prepare("INSERT INTO puroks (street_id, name, description, lat, lng) VALUES (?, ?, ?, ?, ?)")
+       ->execute([(int)$d['street_id'], trim($d['name']), trim($d['description'] ?? ''), $lat, $lng]);
+    $newId = $db->lastInsertId();
+    logActivity('purok_add', "Added purok \"{$d['name']}\".", 'purok', $newId);
+    jsonResponse(['success' => true, 'id' => $newId]);
+
+case 'purok_delete':
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized — admin only.'], 401);
+    $d = body();
+    $db = getDB();
+    $pst = $db->prepare("SELECT name FROM puroks WHERE id = ?");
+    $pst->execute([(int)($d['id'] ?? 0)]);
+    $pname = $pst->fetchColumn();
+    $db->prepare("DELETE FROM puroks WHERE id = ?")->execute([(int)($d['id'] ?? 0)]);
+    logActivity('purok_delete', "Deleted purok \"" . ($pname ?: '#'.$d['id']) . "\" (and all its houses/members).", 'purok', (int)($d['id'] ?? 0));
+    jsonResponse(['success' => true]);
+
+case 'street_add':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized — officials only.'], 401);
+    $d = body();
+    if (empty(trim($d['name'] ?? ''))) jsonResponse(['error' => 'Street name required.'], 400);
+    $db = getDB();
+    $db->prepare("INSERT INTO streets (name, description, lat, lng) VALUES (?, ?, ?, ?)")
+       ->execute([trim($d['name']), trim($d['description'] ?? ''), $d['lat'] ?? null, $d['lng'] ?? null]);
+    $newId = $db->lastInsertId();
+    logActivity('street_add', "Added street \"{$d['name']}\".", 'street', $newId);
+    jsonResponse(['success' => true, 'id' => $newId]);
+
+case 'street_delete':
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized — admin only.'], 401);
+    $d = body();
+    $db = getDB();
+    $sst = $db->prepare("SELECT name FROM streets WHERE id = ?");
+    $sst->execute([(int)($d['id'] ?? 0)]);
+    $sname = $sst->fetchColumn();
+    $db->prepare("DELETE FROM streets WHERE id = ?")->execute([(int)($d['id'] ?? 0)]);
+    logActivity('street_delete', "Deleted street \"" . ($sname ?: '#'.$d['id']) . "\" (and all its puroks/houses/members).", 'street', (int)($d['id'] ?? 0));
+    jsonResponse(['success' => true]);
+
+// ===================== HOUSES =====================
+case 'houses':
+    $pid = (int)($_GET['purok_id'] ?? 0);
+    $sid = (int)($_GET['street_id'] ?? 0);
+    if (!$pid && !$sid) jsonResponse(['error' => 'purok_id or street_id required.'], 400);
+    $db = getDB();
+    if ($pid) {
+        $st = $db->prepare("
+            SELECT h.*, COUNT(m.id) member_count,
+                SUM(m.gender='male') males, SUM(m.gender='female') females,
+                SUM(m.age_group='adult') adults, SUM(m.age_group='child') children, SUM(m.age_group='senior') seniors
+            FROM houses h
+            LEFT JOIN members m ON m.house_id = h.id
+            WHERE h.purok_id = ?
+            GROUP BY h.id ORDER BY h.house_number
+        ");
+        $st->execute([$pid]);
+    } else {
+        $st = $db->prepare("
+            SELECT h.*, COUNT(m.id) member_count,
+                SUM(m.gender='male') males, SUM(m.gender='female') females,
+                SUM(m.age_group='adult') adults, SUM(m.age_group='child') children, SUM(m.age_group='senior') seniors
+            FROM houses h
+            JOIN puroks p ON p.id = h.purok_id
+            LEFT JOIN members m ON m.house_id = h.id
+            WHERE p.street_id = ?
+            GROUP BY h.id ORDER BY h.house_number
+        ");
+        $st->execute([$sid]);
+    }
+    jsonResponse($st->fetchAll());
+
+case 'house_detail':
+    $id = (int)($_GET['id'] ?? 0);
+    $db = getDB();
+    $st = $db->prepare("
+        SELECT h.*, st.id street_id, st.name street_name, p.name purok_name,
+            COUNT(m.id) member_count,
+            SUM(m.gender='male') males, SUM(m.gender='female') females,
+            SUM(m.age_group='adult') adults, SUM(m.age_group='child') children,
+            SUM(m.age_group='senior') seniors, SUM(m.is_pwd=1) pwd_count
+        FROM houses h
+        JOIN puroks p ON p.id = h.purok_id
+        JOIN streets st ON st.id = p.street_id
+        LEFT JOIN members m ON m.house_id = h.id
+        WHERE h.id = ? GROUP BY h.id
+    ");
+    $st->execute([$id]);
+    $h = $st->fetch();
+    if (!$h) jsonResponse(['error' => 'House not found.'], 404);
+    $st2 = $db->prepare("SELECT * FROM members WHERE house_id = ? ORDER BY last_name, first_name");
+    $st2->execute([$id]);
+    $h['members'] = $st2->fetchAll();
+    jsonResponse($h);
+
+case 'house_add':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    if (empty($d['purok_id'])) jsonResponse(['error' => 'purok_id required.'], 400);
+    $db = getDB();
+    $db->prepare("INSERT INTO houses (purok_id, house_number, house_name, lat, lng) VALUES (?, ?, ?, ?, ?)")
+       ->execute([(int)$d['purok_id'], trim($d['house_number'] ?? ''), trim($d['house_name'] ?? ''), $d['lat'] ?? null, $d['lng'] ?? null]);
+    $newId = $db->lastInsertId();
+    logActivity('house_add', "Added house #" . trim($d['house_number'] ?? '') . ".", 'house', $newId);
+    jsonResponse(['success' => true, 'id' => $newId]);
+
+case 'house_edit':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    if (empty($d['purok_id'])) jsonResponse(['error' => 'purok_id required.'], 400);
+    $db = getDB();
+    $db->prepare("UPDATE houses SET purok_id=?, house_number=?, house_name=?, lat=?, lng=? WHERE id=?")
+       ->execute([(int)$d['purok_id'], trim($d['house_number'] ?? ''), trim($d['house_name'] ?? ''), $d['lat'] ?? null, $d['lng'] ?? null, (int)$d['id']]);
+    logActivity('house_edit', "Edited house #" . trim($d['house_number'] ?? '') . ".", 'house', (int)$d['id']);
+    jsonResponse(['success' => true]);
+
+case 'house_delete':
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    $db = getDB();
+    $hst = $db->prepare("SELECT house_number FROM houses WHERE id = ?");
+    $hst->execute([(int)($d['id'] ?? 0)]);
+    $hnum = $hst->fetchColumn();
+    $db->prepare("DELETE FROM houses WHERE id = ?")->execute([(int)($d['id'] ?? 0)]);
+    logActivity('house_delete', "Deleted house #" . ($hnum ?: $d['id']) . " (and its residents).", 'house', (int)($d['id'] ?? 0));
+    jsonResponse(['success' => true]);
+
+// ===================== MEMBERS =====================
+case 'member_add':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    foreach (['house_id','first_name','last_name','gender','age_group'] as $f) {
+        if (empty($d[$f])) jsonResponse(['error' => "$f is required."], 400);
+    }
+    $db = getDB();
+    $db->prepare("INSERT INTO members (house_id, first_name, middle_name, last_name, gender, age_group) VALUES (?,?,?,?,?,?)")
+       ->execute([(int)$d['house_id'], trim($d['first_name']), trim($d['middle_name'] ?? ''), trim($d['last_name']), $d['gender'], $d['age_group']]);
+    $newId = $db->lastInsertId();
+    logActivity('member_add', "Added resident \"" . trim($d['first_name']) . ' ' . trim($d['last_name']) . "\".", 'member', $newId);
+    jsonResponse(['success' => true, 'id' => $newId]);
+
+case 'member_edit':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    $db = getDB();
+    $db->prepare("UPDATE members SET first_name=?, middle_name=?, last_name=?, gender=?, age_group=? WHERE id=?")
+       ->execute([trim($d['first_name']), trim($d['middle_name'] ?? ''), trim($d['last_name']), $d['gender'], $d['age_group'], (int)$d['id']]);
+    logActivity('member_edit', "Edited resident \"" . trim($d['first_name']) . ' ' . trim($d['last_name']) . "\".", 'member', (int)$d['id']);
+    jsonResponse(['success' => true]);
+
+case 'member_delete':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    $db = getDB();
+    $mst = $db->prepare("SELECT first_name, last_name FROM members WHERE id = ?");
+    $mst->execute([(int)($d['id'] ?? 0)]);
+    $mrow = $mst->fetch();
+    $mname = $mrow ? $mrow['first_name'].' '.$mrow['last_name'] : '#'.($d['id'] ?? '');
+    $db->prepare("DELETE FROM members WHERE id = ?")->execute([(int)($d['id'] ?? 0)]);
+    logActivity('member_delete', "Deleted resident \"$mname\".", 'member', (int)($d['id'] ?? 0));
+    jsonResponse(['success' => true]);
+
+// ===================== FACILITIES =====================
+case 'facilities':
+    $db  = getDB();
+    $cat = $_GET['category'] ?? '';
+    if ($cat) {
+        $st = $db->prepare("SELECT * FROM facilities WHERE category = ? ORDER BY name");
+        $st->execute([$cat]);
+    } else {
+        $st = $db->query("SELECT * FROM facilities ORDER BY category, name");
+    }
+    jsonResponse($st->fetchAll());
+
+case 'facility_add':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    if (empty($d['name']) || empty($d['category'])) jsonResponse(['error' => 'Name and category required.'], 400);
+    $db  = getDB();
+    $uid = currentUser()['id'] ?? null;
+    $db->prepare("INSERT INTO facilities (name, category, description, lat, lng, address, contact, operating_hours, added_by) VALUES (?,?,?,?,?,?,?,?,?)")
+       ->execute([trim($d['name']), $d['category'], trim($d['description'] ?? ''), $d['lat'] ?? null, $d['lng'] ?? null, trim($d['address'] ?? ''), trim($d['contact'] ?? ''), trim($d['operating_hours'] ?? ''), $uid]);
+    $newId = $db->lastInsertId();
+    logActivity('facility_add', "Added facility \"{$d['name']}\".", 'facility', $newId);
+    jsonResponse(['success' => true, 'id' => $newId]);
+
+case 'facility_edit':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    $db = getDB();
+    $db->prepare("UPDATE facilities SET name=?, category=?, description=?, lat=?, lng=?, address=?, contact=?, operating_hours=? WHERE id=?")
+       ->execute([trim($d['name']), $d['category'], trim($d['description'] ?? ''), $d['lat'] ?? null, $d['lng'] ?? null, trim($d['address'] ?? ''), trim($d['contact'] ?? ''), trim($d['operating_hours'] ?? ''), (int)$d['id']]);
+    logActivity('facility_edit', "Edited facility \"{$d['name']}\".", 'facility', (int)$d['id']);
+    jsonResponse(['success' => true]);
+
+case 'facility_delete':
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    $db = getDB();
+    $fst = $db->prepare("SELECT name FROM facilities WHERE id = ?");
+    $fst->execute([(int)($d['id'] ?? 0)]);
+    $fname = $fst->fetchColumn();
+    $db->prepare("DELETE FROM facilities WHERE id = ?")->execute([(int)($d['id'] ?? 0)]);
+    logActivity('facility_delete', "Deleted facility \"" . ($fname ?: '#'.$d['id']) . "\".", 'facility', (int)($d['id'] ?? 0));
+    jsonResponse(['success' => true]);
+
+// ===================== INCIDENTS =====================
+case 'incidents_monthly':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $db = getDB();
+    $where = []; $params = [];
+    if (!empty($_GET['year']))   { $where[] = "YEAR(i.created_at) = ?";  $params[] = (int)$_GET['year']; }
+    if (!empty($_GET['month']))  { $where[] = "MONTH(i.created_at) = ?"; $params[] = (int)$_GET['month']; }
+    if (!empty($_GET['status'])) { $where[] = "i.status = ?";            $params[] = $_GET['status']; }
+    $sql = "SELECT i.*, DATE_FORMAT(i.created_at,'%Y-%m-%d') as date_fmt,
+                   MONTHNAME(i.created_at) as month_name, YEAR(i.created_at) as yr,
+                   MONTH(i.created_at) as mo,
+                   i.approved_at,
+                   TIMESTAMPDIFF(MINUTE, i.approved_at, NOW()) as mins_since_approved
+            FROM incidents i"
+         . ($where ? ' WHERE ' . implode(' AND ', $where) : '')
+         . " ORDER BY i.created_at DESC";
+    $st = $db->prepare($sql);
+    $st->execute($params);
+    $rows = $st->fetchAll();
+    // Monthly counts for chart
+    $monthly = [];
+    foreach ($rows as $r) {
+        $key = $r['yr'].'-'.str_pad($r['mo'],2,'0',STR_PAD_LEFT);
+        if (!isset($monthly[$key])) $monthly[$key] = ['label'=>$r['month_name'].' '.$r['yr'],'count'=>0];
+        $monthly[$key]['count']++;
+    }
+    ksort($monthly);
+    jsonResponse(['incidents' => $rows, 'monthly' => array_values($monthly)]);
+
+case 'incidents':
+    $db     = getDB();
+    $where  = [];
+    $params = [];
+    if (!empty($_GET['status']))   { $where[] = "i.status = ?";   $params[] = $_GET['status']; }
+    if (!empty($_GET['category'])) { $where[] = "i.category = ?"; $params[] = $_GET['category']; }
+    // Officials/admins see all; public only sees approved ones
+    if (isOfficial()) {
+        $sql = "SELECT i.*, u.full_name reporter_fullname FROM incidents i LEFT JOIN users u ON u.id = i.reported_by"
+             . ($where ? ' WHERE ' . implode(' AND ', $where) : '')
+             . " ORDER BY i.approved ASC, i.created_at DESC";
+    } else {
+        $where[] = "i.approved = 1";
+        $sql = "SELECT i.*, u.full_name reporter_fullname FROM incidents i LEFT JOIN users u ON u.id = i.reported_by"
+             . " WHERE " . implode(' AND ', $where)
+             . " ORDER BY i.created_at DESC";
+    }
+    $st = $db->prepare($sql);
+    $st->execute($params);
+    jsonResponse($st->fetchAll());
+
+case 'incident_report':
+    // Only residents (and guests) can submit incident reports
+    if (isOfficial()) jsonResponse(['error' => 'Officials cannot submit incident reports. Use the Admin Dashboard to manage incidents.'], 403);
+    $d = body();
+
+    // Honeypot check — real users never see or fill this field. If it has a
+    // value, silently pretend success so the bot doesn't know it was caught
+    // and try harder, but don't actually save anything.
+    if (!empty(trim($d['website'] ?? ''))) {
+        jsonResponse(['success' => true, 'reference_code' => 'RC0000XXXX']);
+    }
+
+    // reCAPTCHA verification — skipped entirely if no secret key is configured
+    // (e.g. local testing), enforced once RECAPTCHA_SECRET_KEY is set in config.php.
+    if (!empty(RECAPTCHA_SECRET_KEY)) {
+        $captchaToken = $d['g_recaptcha_response'] ?? '';
+        if (empty($captchaToken)) {
+            jsonResponse(['error' => 'Please complete the CAPTCHA check.'], 400);
+        }
+        $verifyResult = verifyRecaptcha($captchaToken, $_SERVER['REMOTE_ADDR'] ?? '');
+        if (!$verifyResult) {
+            jsonResponse(['error' => 'CAPTCHA verification failed. Please try again.'], 400);
+        }
+    }
+
+    if (empty(trim($d['description'] ?? '')) || empty($d['category'])) {
+        jsonResponse(['error' => 'Description and category are required.'], 400);
+    }
+    if (empty($d['lat']) || empty($d['lng'])) {
+        jsonResponse(['error' => 'Please pin the incident location on the map.'], 400);
+    }
+    $db  = getDB();
+    $uid = currentUser()['id'] ?? null;
+
+    // Generate a short, unique, human-friendly reference code (excludes
+    // visually-ambiguous characters like 0/O and 1/I/L for easier reading
+    // over the phone), retrying on the rare collision.
+    $alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    do {
+        $code = '';
+        for ($i = 0; $i < 7; $i++) $code .= $alphabet[random_int(0, strlen($alphabet) - 1)];
+        $check = $db->prepare("SELECT id FROM incidents WHERE reference_code = ?");
+        $check->execute([$code]);
+    } while ($check->fetch());
+
+    $db->prepare("INSERT INTO incidents (title, category, description, lat, lng, address, severity, reporter_name, reporter_contact, reported_by, photo, reference_code) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+       ->execute([trim($d['title']), $d['category'], trim($d['description']), $d['lat'] ?? null, $d['lng'] ?? null, trim($d['address'] ?? ''), $d['severity'] ?? 'medium', trim($d['reporter_name'] ?? ''), trim($d['reporter_contact'] ?? ''), $uid, $d['photo'] ?? null, $code]);
+    $newId = $db->lastInsertId();
+    logActivity('incident_report', "Incident reported by \"" . trim($d['reporter_name'] ?? 'Anonymous') . "\" (ref: $code). Contact: " . trim($d['reporter_contact'] ?? '—') . ".", 'incident', $newId);
+    jsonResponse(['success' => true, 'id' => $newId, 'reference_code' => $code]);
+
+case 'check_report_status':
+    // Public, no login required — lookup by reference code only.
+    $code = trim($_GET['code'] ?? '');
+    if (empty($code)) jsonResponse(['error' => 'Please enter a reference code.'], 400);
+    $db = getDB();
+    $st = $db->prepare("SELECT reference_code, category, status, description, created_at, approved, resolution_notes, resolved_at FROM incidents WHERE reference_code = ?");
+    $st->execute([strtoupper($code)]);
+    $r = $st->fetch();
+    if (!$r) jsonResponse(['error' => 'No report found with that reference code. Please check and try again.'], 404);
+    jsonResponse(['report' => $r]);
+
+case 'incident_update':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d        = body();
+    $db       = getDB();
+    $resolved = in_array($d['status'] ?? '', ['resolved','closed']) ? date('Y-m-d H:i:s') : null;
+    $db->prepare("UPDATE incidents SET status=?, severity=?, assigned_to=?, resolution_notes=?, resolved_at=? WHERE id=?")
+       ->execute([$d['status'], $d['severity'] ?? 'medium', $d['assigned_to'] ?? null, trim($d['resolution_notes'] ?? ''), $resolved, (int)$d['id']]);
+    logActivity('incident_update', "Updated incident #{$d['id']} status to \"{$d['status']}\".", 'incident', (int)$d['id']);
+    jsonResponse(['success' => true]);
+
+case 'incident_delete':
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    $db = getDB();
+    $ist = $db->prepare("SELECT title, category FROM incidents WHERE id = ?");
+    $ist->execute([(int)($d['id'] ?? 0)]);
+    $irow = $ist->fetch();
+    $db->prepare("DELETE FROM incidents WHERE id = ?")->execute([(int)($d['id'] ?? 0)]);
+    logActivity('incident_delete', "Deleted incident #" . ($d['id'] ?? '?') . ($irow ? " (\"{$irow['title']}\", {$irow['category']})" : "") . ".", 'incident', (int)($d['id'] ?? 0));
+    jsonResponse(['success' => true]);
+
+// ===================== MAP DATA =====================
+case 'map_data':
+    $db = getDB();
+    $streets = $db->query("
+        SELECT s.*, COUNT(DISTINCT h.id) house_count, COUNT(m.id) population,
+               SUM(m.gender='male') males, SUM(m.gender='female') females,
+               SUM(m.age_group='child') children, SUM(m.age_group='senior') seniors,
+               SUM(m.is_pwd=1) pwd_count
+        FROM streets s
+        LEFT JOIN puroks p ON p.street_id = s.id
+        LEFT JOIN houses h ON h.purok_id = p.id
+        LEFT JOIN members m ON m.house_id=h.id
+        GROUP BY s.id
+    ")->fetchAll();
+    $houses = $db->query("
+        SELECT h.*, st.name street_name, p.name purok_name, COUNT(m.id) member_count
+        FROM houses h
+        JOIN puroks p ON p.id = h.purok_id
+        JOIN streets st ON st.id = p.street_id
+        LEFT JOIN members m ON m.house_id=h.id
+        WHERE h.lat IS NOT NULL GROUP BY h.id
+    ")->fetchAll();
+    $facilities = $db->query("SELECT * FROM facilities WHERE lat IS NOT NULL ORDER BY category")->fetchAll();
+    // Staff see pending (unapproved) reports PLUS approved ones within 12 hours of approval.
+    // The public only ever sees approved incidents within that same 12-hour window.
+    // Admin can still see everything regardless of age via "View All on Map" on the Incidents page.
+    if (isOfficial()) {
+        $incidents = $db->query("
+            SELECT * FROM incidents
+            WHERE lat IS NOT NULL AND status != 'closed'
+            AND (approved = 0 OR approved_at >= DATE_SUB(NOW(), INTERVAL 12 HOUR))
+            ORDER BY approved ASC, created_at DESC
+        ")->fetchAll();
+    } else {
+        $incidents = $db->query("SELECT * FROM incidents WHERE lat IS NOT NULL AND approved = 1 AND status != 'closed' AND approved_at >= DATE_SUB(NOW(), INTERVAL 12 HOUR) ORDER BY created_at DESC")->fetchAll();
+    }
+    $puroks = $db->query("
+        SELECT p.*,
+               COUNT(DISTINCT h.id) house_count,
+               COUNT(m.id) population,
+               SUM(m.gender='male') males,
+               SUM(m.gender='female') females,
+               SUM(m.age_group='child') children,
+               SUM(m.age_group='senior') seniors,
+               SUM(m.is_pwd=1) pwd_count
+        FROM puroks p
+        LEFT JOIN houses h ON h.purok_id = p.id
+        LEFT JOIN members m ON m.house_id = h.id
+        WHERE p.lat IS NOT NULL
+        GROUP BY p.id
+    ")->fetchAll();
+    jsonResponse(compact('streets','houses','facilities','incidents','puroks'));
+
+// ===================== SEARCH =====================
+case 'search':
+    $q = trim($_GET['q'] ?? '');
+    if (strlen($q) < 2) jsonResponse(['results' => []]);
+    $db   = getDB();
+    $like = '%' . $q . '%';
+
+    $h = $db->prepare("SELECT h.id, 'house' type, CONCAT(IFNULL(h.house_number,''),' ',IFNULL(h.house_name,'')) label, st.name sublabel, h.lat, h.lng FROM houses h JOIN puroks p ON p.id=h.purok_id JOIN streets st ON st.id=p.street_id WHERE h.house_name LIKE ? OR h.house_number LIKE ? LIMIT 8");
+    $h->execute([$like,$like]);
+
+    $m = $db->prepare("SELECT m.id, 'member' type, CONCAT(m.last_name,', ',m.first_name,' ',IFNULL(m.middle_name,'')) label, CONCAT(IFNULL(h.house_number,''),' ',IFNULL(h.house_name,''),', ',st.name) sublabel, h.lat, h.lng, m.house_id FROM members m JOIN houses h ON h.id=m.house_id JOIN puroks p ON p.id=h.purok_id JOIN streets st ON st.id=p.street_id WHERE m.first_name LIKE ? OR m.last_name LIKE ? OR m.middle_name LIKE ? LIMIT 8");
+    $m->execute([$like,$like,$like]);
+
+    $f = $db->prepare("SELECT id, 'facility' type, name label, category sublabel, lat, lng FROM facilities WHERE name LIKE ? OR description LIKE ? LIMIT 5");
+    $f->execute([$like,$like]);
+
+    $s = $db->prepare("SELECT id, 'street' type, name label, '' sublabel, lat, lng FROM streets WHERE name LIKE ? LIMIT 4");
+    $s->execute([$like]);
+
+    $p = $db->prepare("SELECT id, 'purok' type, name label, 'Purok' sublabel, lat, lng FROM puroks WHERE name LIKE ? LIMIT 5");
+    $p->execute([$like]);
+
+    jsonResponse(['results' => array_merge($h->fetchAll(), $m->fetchAll(), $f->fetchAll(), $s->fetchAll(), $p->fetchAll())]);
+
+// ===================== USERS (Super Admin only) =====================
+case 'users':
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized — Super Admin only.'], 401);
+    $db = getDB();
+    jsonResponse($db->query("SELECT id, username, full_name, role, email, contact, is_active, created_at FROM users ORDER BY role, full_name")->fetchAll());
+
+case 'user_create':
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized — Super Admin only.'], 401);
+    $d = body();
+    $username  = trim($d['username']  ?? '');
+    $password  = $d['password']  ?? '';
+    $full_name = trim($d['full_name'] ?? '');
+    $email     = trim($d['email']     ?? '');
+    if (empty($username) || empty($password) || empty($full_name) || empty($email)) {
+        jsonResponse(['error' => 'Full name, username, password and Gmail are required.'], 400);
+    }
+    if (strlen($password) < 6) {
+        jsonResponse(['error' => 'Password must be at least 6 characters.'], 400);
+    }
+    if (!preg_match('/^[^\s@]+@gmail\.com$/i', $email)) {
+        jsonResponse(['error' => 'Please provide a valid Gmail address (must end in @gmail.com).'], 400);
+    }
+    $db = getDB();
+    $st = $db->prepare("SELECT id FROM users WHERE username = ?");
+    $st->execute([$username]);
+    if ($st->fetch()) jsonResponse(['error' => 'Username already taken.'], 409);
+
+    $st = $db->prepare("SELECT id FROM users WHERE email = ?");
+    $st->execute([$email]);
+    if ($st->fetch()) jsonResponse(['error' => 'That Gmail address is already linked to another account.'], 409);
+
+    $hash = password_hash($password, PASSWORD_DEFAULT);
+    // Accounts created here are always regular Admin — only this code path
+    // can create new accounts, and it never grants Super Admin.
+    $st = $db->prepare("INSERT INTO users (username, password, full_name, role, email) VALUES (?, ?, ?, 'admin', ?)");
+    $st->execute([$username, $hash, $full_name, $email]);
+    $newId = $db->lastInsertId();
+    logActivity('user_create', "Created Admin account \"$username\" ($full_name).", 'user', $newId);
+    jsonResponse(['success' => true, 'id' => $newId]);
+
+case 'user_toggle':
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized — Super Admin only.'], 401);
+    $d = body();
+    $targetId = (int)($d['id'] ?? 0);
+    if ($targetId === (int)(currentUser()['id'] ?? 0)) {
+        jsonResponse(['error' => 'You cannot deactivate your own account.'], 400);
+    }
+    $db = getDB();
+    $tst = $db->prepare("SELECT username, full_name FROM users WHERE id = ?");
+    $tst->execute([$targetId]);
+    $trow = $tst->fetch();
+    $tname = $trow ? "{$trow['full_name']} ({$trow['username']})" : "#$targetId";
+    $db->prepare("UPDATE users SET is_active = ? WHERE id = ?")->execute([(int)$d['is_active'], $targetId]);
+    $verb = (int)$d['is_active'] ? 'Activated' : 'Deactivated';
+    logActivity('user_toggle', "$verb account \"$tname\".", 'user', $targetId);
+    jsonResponse(['success' => true]);
+
+case 'user_delete':
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized — Super Admin only.'], 401);
+    $d = body();
+    $targetId = (int)($d['id'] ?? 0);
+    if ($targetId === (int)(currentUser()['id'] ?? 0)) {
+        jsonResponse(['error' => 'You cannot delete your own account.'], 400);
+    }
+    $db = getDB();
+    $st = $db->prepare("SELECT username, full_name FROM users WHERE id = ?");
+    $st->execute([$targetId]);
+    $trow = $st->fetch();
+    if (!$trow) jsonResponse(['error' => 'Account not found.'], 404);
+    // Historical incidents/facilities/import logs are preserved — the FK is
+    // ON DELETE SET NULL, so deleting the account just unlinks them, it
+    // doesn't erase the underlying records.
+    $db->prepare("DELETE FROM users WHERE id = ?")->execute([$targetId]);
+    logActivity('user_delete', "Deleted account \"{$trow['full_name']} ({$trow['username']})\".", 'user', $targetId);
+    jsonResponse(['success' => true]);
+
+case 'user_role':
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized — Super Admin only.'], 401);
+    $d = body();
+    if (!in_array($d['role'] ?? '', ['admin','super_admin'])) {
+        jsonResponse(['error' => 'Invalid role.'], 400);
+    }
+    $db = getDB();
+    $rst = $db->prepare("SELECT username, full_name FROM users WHERE id = ?");
+    $rst->execute([(int)$d['id']]);
+    $rrow = $rst->fetch();
+    $rname = $rrow ? "{$rrow['full_name']} ({$rrow['username']})" : "#{$d['id']}";
+    $db->prepare("UPDATE users SET role = ? WHERE id = ?")->execute([$d['role'], (int)$d['id']]);
+    logActivity('user_role', "Changed role of \"$rname\" to \"{$d['role']}\".", 'user', (int)$d['id']);
+    jsonResponse(['success' => true]);
+
+// ===================== BULK IMPORT =====================
+case 'bulk_import':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    if (!isset($_FILES['csv_file'])) jsonResponse(['error' => 'No file uploaded.'], 400);
+    $file = $_FILES['csv_file'];
+    if ($file['error'] !== UPLOAD_ERR_OK) jsonResponse(['error' => 'File upload error.'], 400);
+    if (strtolower(pathinfo($file['name'], PATHINFO_EXTENSION)) !== 'csv') jsonResponse(['error' => 'Only CSV files are allowed.'], 400);
+
+    $db     = getDB();
+    $handle = fopen($file['tmp_name'], 'r');
+    fgetcsv($handle); // skip header row
+    $imported = $failed = 0;
+
+    $db->beginTransaction();
+    try {
+        while (($row = fgetcsv($handle)) !== false) {
+            if (count($row) < 9) { $failed++; continue; }
+            [$sname,$pname,$hnum,$hname,$hlat,$hlng,$fname,$mname,$lname,$gender,$age,$bdate] = array_pad($row, 12, '');
+
+            // Get or create street
+            $st = $db->prepare("SELECT id FROM streets WHERE name = ?");
+            $st->execute([trim($sname)]);
+            $sv = $st->fetch();
+            if (!$sv) {
+                $db->prepare("INSERT INTO streets (name) VALUES (?)")->execute([trim($sname)]);
+                $sid = $db->lastInsertId();
+            } else { $sid = $sv['id']; }
+
+            // Get or create purok under this street
+            $purokName = trim($pname) !== '' ? trim($pname) : 'Unassigned';
+            $pst = $db->prepare("SELECT id FROM puroks WHERE street_id = ? AND name = ?");
+            $pst->execute([$sid, $purokName]);
+            $pv = $pst->fetch();
+            if (!$pv) {
+                $db->prepare("INSERT INTO puroks (street_id, name) VALUES (?, ?)")->execute([$sid, $purokName]);
+                $pid = $db->lastInsertId();
+            } else { $pid = $pv['id']; }
+
+            // Get or create house under this purok
+            $st = $db->prepare("SELECT id FROM houses WHERE purok_id = ? AND house_number = ?");
+            $st->execute([$pid, trim($hnum)]);
+            $hv = $st->fetch();
+            if (!$hv) {
+                $db->prepare("INSERT INTO houses (purok_id, house_number, house_name, lat, lng) VALUES (?,?,?,?,?)")
+                   ->execute([$pid, trim($hnum), trim($hname), $hlat ?: null, $hlng ?: null]);
+                $hid = $db->lastInsertId();
+            } else { $hid = $hv['id']; }
+
+            $g = strtolower(trim($gender));
+            $a = strtolower(trim($age));
+            if (!in_array($g, ['male','female']) || !in_array($a, ['adult','child','senior']) || empty(trim($fname)) || empty(trim($lname))) {
+                $failed++; continue;
+            }
+            $db->prepare("INSERT INTO members (house_id, first_name, middle_name, last_name, gender, age_group, birth_date) VALUES (?,?,?,?,?,?,?)")
+               ->execute([$hid, trim($fname), trim($mname), trim($lname), $g, $a, $bdate ?: null]);
+            $imported++;
+        }
+        $db->commit();
+    } catch (Exception $e) {
+        $db->rollBack();
+        jsonResponse(['error' => 'Import failed: ' . $e->getMessage()], 500);
+    }
+    fclose($handle);
+
+    $uid = currentUser()['id'] ?? null;
+    $db->prepare("INSERT INTO import_logs (user_id, filename, rows_imported, rows_failed) VALUES (?,?,?,?)")
+       ->execute([$uid, $file['name'], $imported, $failed]);
+    logActivity('bulk_import', "Ran bulk import \"{$file['name']}\" — $imported imported, $failed skipped.", 'import', null);
+
+    jsonResponse(['success' => true, 'imported' => $imported, 'failed' => $failed,
+        'message' => "Successfully imported $imported records. $failed rows skipped."]);
+
+case 'import_logs':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $db = getDB();
+    jsonResponse($db->query("SELECT il.*, u.full_name FROM import_logs il LEFT JOIN users u ON u.id=il.user_id ORDER BY il.imported_at DESC LIMIT 20")->fetchAll());
+
+case 'activity_logs':
+    // Super Admin only — the full non-repudiation audit trail.
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized — Super Admin only.'], 401);
+    $db = getDB();
+    $where = []; $params = [];
+    if (!empty($_GET['username']))  { $where[] = "username = ?";    $params[] = $_GET['username']; }
+    if (!empty($_GET['log_action'])) { $where[] = "action = ?";      $params[] = $_GET['log_action']; }
+    if (!empty($_GET['date_from'])) { $where[] = "created_at >= ?"; $params[] = $_GET['date_from'].' 00:00:00'; }
+    if (!empty($_GET['date_to']))   { $where[] = "created_at <= ?"; $params[] = $_GET['date_to'].' 23:59:59'; }
+    $sql = "SELECT * FROM activity_logs" . ($where ? ' WHERE ' . implode(' AND ', $where) : '') . " ORDER BY created_at DESC LIMIT 500";
+    $st = $db->prepare($sql);
+    $st->execute($params);
+    jsonResponse($st->fetchAll());
+
+case 'activity_log_users':
+    // Distinct usernames that appear in the log, for the filter dropdown.
+    if (!isAdmin()) jsonResponse(['error' => 'Unauthorized — Super Admin only.'], 401);
+    $db = getDB();
+    jsonResponse($db->query("SELECT DISTINCT username, full_name FROM activity_logs WHERE username IS NOT NULL ORDER BY full_name")->fetchAll());
+
+
+case 'incidents_pending':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $db = getDB();
+    $rows = $db->query("
+        SELECT i.*, u.full_name reporter_fullname
+        FROM incidents i
+        LEFT JOIN users u ON u.id = i.reported_by
+        WHERE i.approved = 0 AND i.status != 'closed'
+        ORDER BY i.created_at DESC
+    ")->fetchAll();
+    jsonResponse($rows);
+
+case 'incident_approve':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    $db = getDB();
+    $uid = currentUser()['id'] ?? null;
+    $db->prepare("UPDATE incidents SET approved = 1, approved_by = ?, approved_at = NOW(), status = 'investigating' WHERE id = ?")
+       ->execute([$uid, (int)($d['id'] ?? 0)]);
+    logActivity('incident_approve', "Approved incident #" . ($d['id'] ?? '?') . " — now visible on the public map.", 'incident', (int)($d['id'] ?? 0));
+    jsonResponse(['success' => true]);
+
+case 'incident_reject':
+    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
+    $d = body();
+    $db = getDB();
+    $db->prepare("UPDATE incidents SET approved = 0, status = 'closed', rejection_reason = ? WHERE id = ?")
+       ->execute([trim($d['reason'] ?? ''), (int)($d['id'] ?? 0)]);
+    logActivity('incident_reject', "Rejected incident #" . ($d['id'] ?? '?') . ". Reason: " . trim($d['reason'] ?? '—') . ".", 'incident', (int)($d['id'] ?? 0));
+    jsonResponse(['success' => true]);
+
+default:
+    jsonResponse(['error' => "Unknown action: $action"], 404);
+}
+
+ob_end_flush();
+?>

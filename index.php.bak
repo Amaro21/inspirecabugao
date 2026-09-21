@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>INSPIRE – Barangay Cabugao, Bato, Catanduanes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="stylesheet" href="assets/css/style.css?v=11">
+</head>
+<body>
+
+<!-- HEADER -->
+<header class="header">
+  <div class="header-inner">
+    <div class="logo-group">
+      <div class="logo-icon">
+        <svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="20" cy="20" r="20" fill="#1f5c32"/>
+          <path d="M20 8C15.03 8 11 12.03 11 17c0 7.25 9 17 9 17s9-9.75 9-17c0-4.97-4.03-9-9-9zm0 12.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z" fill="white"/>
+        </svg>
+      </div>
+      <div class="logo-text">
+        <span class="logo-title">INSPIRE</span>
+        <span class="logo-sub">Brgy. Cabugao · Bato, Catanduanes</span>
+      </div>
+    </div>
+    <div class="header-search">
+      <input type="text" id="globalSearch" placeholder="Search households, residents, facilities..." autocomplete="off" oninput="doSearch(this.value)">
+      <div class="search-results" id="searchResults"></div>
+    </div>
+    <nav class="nav">
+      <!-- Map is always visible to everyone -->
+      <button class="nav-btn active" data-page="map" onclick="showPage('map')">Map</button>
+      <!-- These tabs only show when logged in as admin/official -->
+      <button class="nav-btn admin-nav-tab" data-page="population" onclick="showPage('population')" style="display:none">Population</button>
+      <button class="nav-btn admin-nav-tab" data-page="facilities" onclick="showPage('facilities')" style="display:none">Facilities</button>
+      <button class="nav-btn admin-nav-tab" data-page="incidents" onclick="showPage('incidents')" style="display:none">Incidents</button>
+      <button class="nav-btn admin-nav-tab" data-page="admin" id="adminTab" onclick="showPage('admin')" style="display:none">Admin</button>
+      <div class="nav-user" id="navUser" style="display:none">
+        <span class="user-badge" id="userBadge"></span>
+        <button class="nav-btn logout-btn" onclick="doLogout()">Logout</button>
+      </div>
+      <button class="nav-btn login-btn" id="loginBtn" onclick="openModal('loginModal')">Login</button>
+    </nav>
+  </div>
+</header>
+
+<!-- STATS BAR (visible to everyone) -->
+<div class="stats-bar">
+  <div class="stat-item"><span class="stat-num" id="sPop">—</span><span class="stat-lbl">Population</span></div>
+  <div class="stat-div"></div>
+  <div class="stat-item"><span class="stat-num" id="sHouses">—</span><span class="stat-lbl">Households</span></div>
+  <div class="stat-div"></div>
+  <div class="stat-item"><span class="stat-num" id="sStreets">—</span><span class="stat-lbl">Streets</span></div>
+  <div class="stat-div"></div>
+  <div class="stat-item"><span class="stat-num" id="sFacilities">—</span><span class="stat-lbl">Facilities</span></div>
+  <div class="stat-div"></div>
+  <div class="stat-item"><span class="stat-num" id="sIncidents" style="color:#c0392b">—</span><span class="stat-lbl">Active Incidents</span></div>
+  <div class="stat-div"></div>
+  <div class="stat-item"><span class="stat-num" id="sMales">—</span><span class="stat-lbl">Male</span></div>
+  <div class="stat-div"></div>
+  <div class="stat-item"><span class="stat-num" id="sFemales">—</span><span class="stat-lbl">Female</span></div>
+  <div class="stat-div"></div>
+  <div class="stat-item"><span class="stat-num" id="sSeniors" style="color:#5a1a9a">—</span><span class="stat-lbl">Senior Citizens</span></div>
+</div>
+
+<!-- MAP PAGE (default for all visitors) -->
+<div class="page active" id="page-map">
+  <div class="map-layout">
+    <div class="map-sidebar">
+      <div class="sidebar-tabs">
+        <button class="stab active" onclick="sidebarTab('streets-tab')">Streets</button>
+        <button class="stab" onclick="sidebarTab('facilities-list')">Facilities</button>
+        <button class="stab" onclick="sidebarTab('incidents-list')">Incidents</button>
+      </div>
+      <div class="sidebar-body" id="sbStreets">
+        <div class="sb-actions" id="addHouseBtn" style="display:none">
+          <button class="btn-sm btn-primary" onclick="openAddHouseModal()">+ Add House</button>
+        </div>
+        <div id="streetList"><div class="loading-state">Loading...</div></div>
+      </div>
+      <div class="sidebar-body hidden" id="sbFacilities">
+        <div class="sb-actions" id="addFacilityBtn" style="display:none">
+          <button class="btn-sm btn-primary" onclick="openFacilityModal()">+ Add Facility</button>
+        </div>
+        <div class="fcat-filter">
+          <select id="facCatFilter" class="form-control" onchange="loadSidebarFacilities()" style="font-size:.78rem;padding:5px 8px">
+            <option value="">All Categories</option>
+            <option value="government">Government</option>
+            <option value="health">Health</option>
+            <option value="education">Education</option>
+            <option value="religious">Religious</option>
+            <option value="commercial">Commercial</option>
+            <option value="infrastructure">Infrastructure</option>
+            <option value="landmark">Landmark</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+        <div id="facilityList"><div class="loading-state">Loading...</div></div>
+      </div>
+      <div class="sidebar-body hidden" id="sbIncidents">
+        <div class="sb-actions" id="reportIncidentSidebarBtn">
+          <button class="btn-sm btn-danger" onclick="openIncidentModal()">Report Incident</button>
+        </div>
+        <div class="sb-actions" id="officialIncidentNote" style="display:none">
+          <span class="hint" style="font-size:.73rem;color:var(--ink-lt)">Manage incidents via Admin Dashboard</span>
+        </div>
+        <div class="fcat-filter">
+          <select id="incStatusFilter" class="form-control" onchange="loadSidebarIncidents()" style="font-size:.78rem;padding:5px 8px">
+            <option value="">All Status</option>
+            <option value="open">Open</option>
+            <option value="investigating">Investigating</option>
+            <option value="resolved">Resolved</option>
+          </select>
+        </div>
+        <div id="incidentList"><div class="loading-state">Loading...</div></div>
+      </div>
+    </div>
+    <div class="map-container">
+      <div id="map"></div>
+      <div class="brgy-banner">Barangay Cabugao, Bato, Catanduanes</div>
+      <div class="map-controls">
+        <button class="layer-btn active" id="btnStreet" onclick="setLayer('street')">Map</button>
+        <button class="layer-btn" id="btnSat" onclick="setLayer('satellite')">Satellite</button>
+      </div>
+      <div class="map-legend">
+        <div class="leg-item"><span class="leg-dot" style="background:#1f5c32"></span>Street</div>
+        <div class="leg-item"><span class="leg-dot" style="background:#e67e22"></span>House</div>
+        <div class="leg-item"><span class="leg-dot" style="background:#7b3fa0"></span>Purok</div>
+        <div class="leg-item"><span class="leg-dot" style="background:#1a4f8a"></span>Facility</div>
+        <div class="leg-item"><span class="leg-dot" style="background:#c0392b"></span>Incident</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- POPULATION PAGE (admin/official only) -->
+<div class="page" id="page-population">
+  <div class="page-content">
+    <div class="page-header">
+      <h2>Population Data</h2>
+      <p>Household &amp; resident records — Barangay Cabugao</p>
+    </div>
+    <div id="popContent"><div class="loading-state">Loading...</div></div>
+  </div>
+</div>
+
+<!-- FACILITIES PAGE (admin/official only) -->
+<div class="page" id="page-facilities">
+  <div class="page-content">
+    <div class="page-header-row">
+      <div>
+        <h2>Facilities &amp; Landmarks</h2>
+        <p>Schools, health centers, government offices, and more</p>
+      </div>
+      <button class="btn-primary" id="addFacilityPageBtn" style="display:none" onclick="openFacilityModal()">+ Add Facility</button>
+    </div>
+    <div class="cat-pills" id="catPills">
+      <button class="cat-pill active" onclick="filterFacilitiesPage('')">All</button>
+      <button class="cat-pill" onclick="filterFacilitiesPage('government')">Government</button>
+      <button class="cat-pill" onclick="filterFacilitiesPage('health')">Health</button>
+      <button class="cat-pill" onclick="filterFacilitiesPage('education')">Education</button>
+      <button class="cat-pill" onclick="filterFacilitiesPage('religious')">Religious</button>
+      <button class="cat-pill" onclick="filterFacilitiesPage('commercial')">Commercial</button>
+      <button class="cat-pill" onclick="filterFacilitiesPage('infrastructure')">Infrastructure</button>
+      <button class="cat-pill" onclick="filterFacilitiesPage('landmark')">Landmark</button>
+    </div>
+    <div id="facilitiesGrid"><div class="loading-state">Loading...</div></div>
+  </div>
+</div>
+
+<!-- INCIDENTS PAGE (admin/official only) -->
+<div class="page" id="page-incidents">
+  <div class="page-content">
+    <div class="page-header-row">
+      <div>
+        <h2>Incident Reports</h2>
+        <p>Community-reported incidents and emergencies</p>
+      </div>
+      <button class="btn-danger-outline" id="reportIncidentPageBtn" onclick="openIncidentModal()">Report Incident</button>
+    </div>
+    <div class="incident-filters">
+      <select id="incPageStatus" class="form-control" onchange="loadIncidentsPage()" style="max-width:160px">
+        <option value="">All Status</option>
+        <option value="open">Open</option>
+        <option value="investigating">Investigating</option>
+        <option value="resolved">Resolved</option>
+        <option value="closed">Closed</option>
+      </select>
+      <select id="incPageCat" class="form-control" onchange="loadIncidentsPage()" style="max-width:160px">
+        <option value="">All Types</option>
+        <option value="fire">Fire</option>
+        <option value="flood">Flood</option>
+        <option value="accident">Accident</option>
+        <option value="crime">Crime</option>
+        <option value="medical">Medical</option>
+        <option value="infrastructure">Infrastructure</option>
+        <option value="other">Other</option>
+      </select>
+    </div>
+    <div id="incidentsGrid"><div class="loading-state">Loading...</div></div>
+  </div>
+</div>
+
+<!-- ADMIN PAGE -->
+<div class="page" id="page-admin">
+  <div class="page-content">
+    <div class="page-header">
+      <h2>Admin Dashboard</h2>
+      <p id="adminWelcome">Welcome</p>
+    </div>
+    <div class="admin-tabs">
+      <button class="adtab active" onclick="adminTab('import')">Bulk Import</button>
+      <button class="adtab" onclick="adminTab('pending')">Pending Reports <span id="pendingBadge" class="pending-badge" style="display:none">0</span></button>
+      <button class="adtab admin-only-tab" onclick="adminTab('houses')" id="housesTab">Add House</button>
+      <button class="adtab admin-only-tab" onclick="adminTab('streets')" id="streetsTab">Streets</button>
+      <button class="adtab admin-only-tab" onclick="adminTab('puroks')" id="puroksTab">Puroks</button>
+      <button class="adtab admin-only-tab" onclick="adminTab('users')" id="usersTab">Users</button>
+      <button class="adtab admin-only-tab" onclick="adminTab('logs')" id="logsTab">Logs</button>
+    </div>
+
+    <!-- IMPORT -->
+    <div class="admin-panel active" id="ap-import">
+      <div class="admin-card">
+        <div class="admin-card-hd"><h3>Bulk Import Population Data</h3></div>
+        <div class="admin-card-bd">
+          <p class="hint">CSV columns: <code>street_name, house_number, house_name, house_lat, house_lng, first_name, middle_name, last_name, gender, age_group, birth_date</code></p>
+          <a href="assets/sample_import.csv" download class="btn-secondary" style="margin:10px 0;display:inline-flex">Download Sample CSV</a>
+          <div class="file-drop" id="fileDrop" onclick="document.getElementById('csvFile').click()">
+            <input type="file" id="csvFile" accept=".csv" style="display:none" onchange="handleFile(this)">
+            <div class="upload-icon">↑</div>
+            <p style="font-size:.84rem;color:var(--ink-mid)">Click or drag a CSV file here</p>
+          </div>
+          <div id="selFile" style="display:none" class="sel-file">
+            <span id="selFileName"></span>
+            <button onclick="clearFile()">✕</button>
+          </div>
+          <button class="btn-primary mt-2" id="importBtn" onclick="doBulkImport()">Import Data</button>
+          <div id="importResult" class="import-result" style="display:none"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PENDING INCIDENTS -->
+    <div class="admin-panel" id="ap-pending">
+      <div class="admin-card">
+        <div class="admin-card-hd"><h3>Pending Incident Reports — Awaiting Approval</h3></div>
+        <div class="admin-card-bd" id="pendingList"><div class="loading-state">Loading...</div></div>
+      </div>
+    </div>
+
+    <!-- ADD HOUSE -->
+    <div class="admin-panel" id="ap-houses">
+      <div class="admin-card">
+        <div class="admin-card-hd"><h3>Add New House</h3></div>
+        <div class="admin-card-bd">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Street *</label>
+              <select id="ahAdminStreet" class="form-control">
+                <option value="">Select street...</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Purok *</label>
+              <select id="ahAdminPurok" class="form-control">
+                <option value="">Select purok...</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>House Number</label>
+              <input type="text" id="ahAdminNum" class="form-control" placeholder="e.g. 12">
+            </div>
+            <div class="form-group"></div>
+          </div>
+          <div class="form-group mt-2">
+            <label>Pin House Location on Map *</label>
+            <div class="pin-map-wrap">
+              <div class="pin-map-label">Click the map to drop a pin for this house</div>
+              <div id="houseAdminPinMap"></div>
+              <div id="houseAdminPinInfo" class="pin-info" style="display:none">
+                Pinned at: <strong id="houseAdminPinCoord"></strong>
+                <button onclick="clearHouseAdminPin()" class="btn-clr">✕ Clear</button>
+              </div>
+              <div id="houseAdminPinEmpty" class="pin-empty">No pin placed — click the map to set the house location</div>
+            </div>
+          </div>
+          <input type="hidden" id="ahAdminLat">
+          <input type="hidden" id="ahAdminLng">
+          <div id="ahAdminErr" class="err-msg" style="display:none"></div>
+          <button class="btn-primary mt-2 full" onclick="submitAdminHouse()">Save House</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- STREETS -->
+    <div class="admin-panel" id="ap-streets">
+      <div class="admin-card">
+        <div class="admin-card-hd"><h3>Add New Street</h3></div>
+        <div class="admin-card-bd">
+          <div class="form-row">
+            <div class="form-group"><label>Street Name *</label><input type="text" id="nsName" class="form-control" placeholder="e.g. San Roque Street"></div>
+            <div class="form-group"><label>Description</label><input type="text" id="nsDesc" class="form-control" placeholder="Optional"></div>
+          </div>
+          <div class="form-group mt-2">
+            <label>Pin Street Location on Map</label>
+            <div class="pin-map-wrap">
+              <div class="pin-map-label">Click on the map to mark this street's location</div>
+              <div id="streetPinMap"></div>
+              <div id="streetPinInfo" class="pin-info" style="display:none">
+                Pinned at: <strong id="streetPinCoord"></strong>
+                <button onclick="clearStreetPin()" class="btn-clr">✕ Clear</button>
+              </div>
+              <div id="streetPinEmpty" class="pin-empty">No pin placed yet</div>
+            </div>
+          </div>
+          <input type="hidden" id="nsLat">
+          <input type="hidden" id="nsLng">
+          <div id="nsErr" class="err-msg" style="display:none"></div>
+          <button class="btn-primary mt-2" onclick="addStreet()">Add Street</button>
+        </div>
+      </div>
+      <div class="admin-card mt-2">
+        <div class="admin-card-hd"><h3>Current Streets</h3></div>
+        <div class="admin-card-bd" id="adminStreets"><div class="loading-state">Loading...</div></div>
+      </div>
+    </div>
+
+
+    <!-- PUROKS -->
+    <div class="admin-panel" id="ap-puroks">
+      <div class="admin-card">
+        <div class="admin-card-hd"><h3>Add New Purok</h3></div>
+        <div class="admin-card-bd">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Purok Name *</label>
+              <input type="text" id="purokName" class="form-control" placeholder="e.g. Purok 1 or Purok Sampaguita">
+            </div>
+            <div class="form-group">
+              <label>Description</label>
+              <input type="text" id="purokDesc" class="form-control" placeholder="Optional">
+            </div>
+          </div>
+          <div class="form-group mt-2">
+            <label>Pin Purok Location on Map</label>
+            <div class="pin-map-wrap">
+              <div class="pin-map-label">Click on the map to mark this purok's location</div>
+              <div id="purokPinMap"></div>
+              <div id="purokPinInfo" class="pin-info" style="display:none">
+                Pinned at: <strong id="purokPinCoord"></strong>
+                <button onclick="clearPurokPin()" class="btn-clr">✕ Clear</button>
+              </div>
+              <div id="purokPinEmpty" class="pin-empty">No pin placed yet</div>
+            </div>
+          </div>
+          <input type="hidden" id="purokLat">
+          <input type="hidden" id="purokLng">
+          <div id="purokErr" class="err-msg" style="display:none"></div>
+          <button class="btn-primary mt-2" onclick="addPurok()">Add Purok</button>
+        </div>
+      </div>
+      <div class="admin-card mt-2">
+        <div class="admin-card-hd"><h3>Current Puroks</h3></div>
+        <div class="admin-card-bd" id="adminPurokList"><div class="loading-state">Loading...</div></div>
+      </div>
+    </div>
+
+    <!-- USERS -->
+    <div class="admin-panel" id="ap-users">
+      <div class="admin-card">
+        <div class="admin-card-hd"><h3>User Management</h3></div>
+        <div class="admin-card-bd" id="usersTable"><div class="loading-state">Loading...</div></div>
+      </div>
+    </div>
+
+    <!-- LOGS -->
+    <div class="admin-panel" id="ap-logs">
+      <div class="admin-card">
+        <div class="admin-card-hd"><h3>Import History</h3></div>
+        <div class="admin-card-bd" id="importLogs"><div class="loading-state">Loading...</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== MODALS ==================== -->
+
+<!-- LOGIN (admin/official only) -->
+<div class="modal-overlay" id="loginModal" onclick="closeModal('loginModal')">
+  <div class="modal" onclick="e(event)" style="max-width:380px">
+    <div class="login-brand">
+      <svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="20" cy="20" r="20" fill="#1f5c32"/>
+        <path d="M20 8C15.03 8 11 12.03 11 17c0 7.25 9 17 9 17s9-9.75 9-17c0-4.97-4.03-9-9-9zm0 12.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z" fill="white"/>
+      </svg>
+      <h3>INSPIRE</h3>
+      <p>Barangay Officials &amp; Admin Login</p>
+    </div>
+    <div class="modal-bd">
+      <div class="form-group"><label>Username</label><input type="text" id="lUser" class="form-control" placeholder="Enter username" autocomplete="username"></div>
+      <div class="form-group"><label>Password</label><input type="password" id="lPass" class="form-control" placeholder="Enter password" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()"></div>
+      <div id="loginErr" class="err-msg" style="display:none"></div>
+      <button class="btn-primary full" style="margin-top:4px" onclick="doLogin()">Sign In</button>
+      <p class="hint mt-2 tc" style="font-size:.74rem">Access restricted to Barangay Officials and Administrators</p>
+    </div>
+  </div>
+</div>
+
+<!-- HOUSE DETAIL -->
+<div class="modal-overlay" id="houseModal" onclick="closeModal('houseModal')">
+  <div class="modal" onclick="e(event)">
+    <div class="modal-hd"><h3 id="houseMTitle">Household</h3><button class="modal-x" onclick="closeModal('houseModal')">✕</button></div>
+    <div class="modal-bd" id="houseMBody">Loading...</div>
+  </div>
+</div>
+
+<!-- ADD/EDIT HOUSE -->
+<div class="modal-overlay" id="addHouseModal" onclick="closeModal('addHouseModal')">
+  <div class="modal modal-wide" onclick="e(event)">
+    <div class="modal-hd"><h3 id="addHouseTitle">Add House</h3><button class="modal-x" onclick="closeModal('addHouseModal')">✕</button></div>
+    <div class="modal-bd">
+      <div class="pin-map-wrap">
+        <div class="pin-map-label">Click the map to pin house location</div>
+        <div id="pinMap"></div>
+        <div id="ahOob" class="pin-oob-warn">Location is outside Barangay Cabugao boundaries</div>
+        <div id="pinInfo" class="pin-info" style="display:none"><strong id="pinCoord"></strong> <button onclick="clearPin()" class="btn-clr">✕ Clear</button></div>
+        <div id="pinEmpty" class="pin-empty">No pin placed — click the map to set location</div>
+      </div>
+      <div class="form-row mt-2">
+        <div class="form-group">
+          <label>Street *</label>
+          <select id="ahStreet" class="form-control">
+            <option value="">Select street...</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Purok *</label>
+          <select id="ahPurok" class="form-control">
+            <option value="">Select purok...</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group"><label>House Number *</label><input type="text" id="ahNum" class="form-control" placeholder="e.g. 12 or Block 3 Lot 5"></div>
+      <input type="hidden" id="ahLat"><input type="hidden" id="ahLng"><input type="hidden" id="ahId">
+      <div id="ahErr" class="err-msg" style="display:none"></div>
+      <button class="btn-primary full" onclick="submitHouse()">Save House</button>
+    </div>
+  </div>
+</div>
+
+<!-- ADD/EDIT FACILITY -->
+<div class="modal-overlay" id="facilityModal" onclick="closeModal('facilityModal')">
+  <div class="modal modal-wide" onclick="e(event)">
+    <div class="modal-hd"><h3 id="facilityModalTitle">Add Facility</h3><button class="modal-x" onclick="closeModal('facilityModal')">✕</button></div>
+    <div class="modal-bd">
+      <div class="pin-map-wrap">
+        <div class="pin-map-label">Click the map to pin facility location</div>
+        <div id="facPinMap"></div>
+        <div id="fOob" class="pin-oob-warn">Location is outside Barangay Cabugao boundaries</div>
+        <div id="facPinInfo" class="pin-info" style="display:none"><strong id="facPinCoord"></strong> <button onclick="clearFacPin()" class="btn-clr">✕ Clear</button></div>
+        <div id="facPinEmpty" class="pin-empty">No pin placed yet</div>
+      </div>
+      <div class="form-row mt-2">
+        <div class="form-group"><label>Facility Name *</label><input type="text" id="fName" class="form-control"></div>
+        <div class="form-group">
+          <label>Category *</label>
+          <select id="fCat" class="form-control">
+            <option value="government">Government</option>
+            <option value="health">Health</option>
+            <option value="education">Education</option>
+            <option value="religious">Religious</option>
+            <option value="commercial">Commercial</option>
+            <option value="infrastructure">Infrastructure</option>
+            <option value="landmark">Landmark</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group"><label>Description</label><textarea id="fDesc" class="form-control" rows="2"></textarea></div>
+      <div class="form-row">
+        <div class="form-group"><label>Address</label><input type="text" id="fAddr" class="form-control"></div>
+        <div class="form-group"><label>Contact</label><input type="text" id="fContact" class="form-control"></div>
+      </div>
+      <div class="form-group"><label>Operating Hours</label><input type="text" id="fHours" class="form-control" placeholder="Mon–Fri 8AM–5PM"></div>
+      <input type="hidden" id="fLat"><input type="hidden" id="fLng"><input type="hidden" id="fId">
+      <div id="fErr" class="err-msg" style="display:none"></div>
+      <button class="btn-primary full" onclick="submitFacility()">Save Facility</button>
+    </div>
+  </div>
+</div>
+
+<!-- INCIDENT REPORT -->
+<div class="modal-overlay" id="incidentModal" onclick="closeModal('incidentModal')">
+  <div class="modal modal-wide" onclick="e(event)">
+    <div class="modal-hd"><h3 id="incModalTitle">Report Incident</h3><button class="modal-x" onclick="closeModal('incidentModal')">✕</button></div>
+    <div class="modal-bd">
+      <div class="pin-map-wrap">
+        <div class="pin-map-label">Click the map to mark the incident location</div>
+        <button class="use-location-btn" id="useLocationBtn" onclick="useMyLocation()" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="9" stroke-dasharray="2 2"/></svg>
+          Use My Current Location
+        </button>
+        <div id="incPinMap"></div>
+        <div id="iOob" class="pin-oob-warn">Location is outside Barangay Cabugao boundaries</div>
+        <div id="incPinInfo" class="pin-info" style="display:none"><strong id="incPinCoord"></strong> <button onclick="clearIncPin()" class="btn-clr">✕ Clear</button></div>
+        <div id="incPinEmpty" class="pin-empty">Pin the location of the incident</div>
+      </div>
+      <div class="form-row mt-2">
+        <div class="form-group"><label>Title *</label><input type="text" id="iTitle" class="form-control" placeholder="e.g. Fire at San Roque Street"></div>
+        <div class="form-group">
+          <label>Type *</label>
+          <select id="iCat" class="form-control">
+            <option value="fire">Fire</option>
+            <option value="flood">Flood</option>
+            <option value="accident">Accident</option>
+            <option value="crime">Crime</option>
+            <option value="medical">Medical Emergency</option>
+            <option value="infrastructure">Infrastructure</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Severity *</label>
+          <select id="iSev" class="form-control">
+            <option value="low">Low</option>
+            <option value="medium" selected>Medium</option>
+            <option value="high">High</option>
+            <option value="critical">Critical</option>
+          </select>
+        </div>
+        <div class="form-group"><label>Address / Location</label><input type="text" id="iAddr" class="form-control" placeholder="Near San Antonio Street"></div>
+      </div>
+      <div class="form-group"><label>Description *</label><textarea id="iDesc" class="form-control" rows="3" placeholder="Describe what happened..."></textarea></div>
+      <div class="form-row">
+        <div class="form-group"><label>Your Name</label><input type="text" id="iName" class="form-control" placeholder="Optional"></div>
+        <div class="form-group"><label>Your Contact</label><input type="text" id="iContact" class="form-control" placeholder="Optional"></div>
+      </div>
+      <input type="hidden" id="iLat"><input type="hidden" id="iLng"><input type="hidden" id="iId">
+      <div id="iErr" class="err-msg" style="display:none"></div>
+      <div class="approval-note">Your report will appear on the map only after approval by a Barangay Official.</div>
+      <button class="btn-danger full" onclick="submitIncident()">Submit Report</button>
+    </div>
+  </div>
+</div>
+
+<!-- INCIDENT MANAGE -->
+<div class="modal-overlay" id="incManageModal" onclick="closeModal('incManageModal')">
+  <div class="modal" onclick="e(event)" style="max-width:500px">
+    <div class="modal-hd"><h3>Manage Incident</h3><button class="modal-x" onclick="closeModal('incManageModal')">✕</button></div>
+    <div class="modal-bd" id="incManageBd">Loading...</div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="assets/js/app.js?v=11"></script>
+<script>
+// Override checkAuth to control admin-only nav tabs
+const _origCheckAuth = typeof checkAuth === 'function' ? checkAuth : null;
+</script>
+
+<!-- MOBILE BOTTOM NAV -->
+<nav class="mobile-nav" id="mobileNav">
+  <div class="mobile-nav-inner">
+    <button class="mob-nav-btn active" id="mnMap" onclick="showPage('map')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13V7m0 13l6-3m-6-10l6-3m0 13V4m0 13l5.447 2.724A1 1 0 0021 18.382V7.618a1 1 0 00-1.447-.894L15 4"/></svg>
+      Map
+    </button>
+    <button class="mob-nav-btn admin-nav-tab" id="mnPop" onclick="showPage('population')" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+      People
+    </button>
+    <button class="mob-nav-btn" id="mnReport" onclick="openIncidentModal()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+      Report
+    </button>
+    <button class="mob-nav-btn admin-nav-tab" id="mnInc" onclick="showPage('incidents')" style="display:none">
+      <span class="mob-nav-badge" id="mobIncBadge"></span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+      Incidents
+    </button>
+    <button class="mob-nav-btn admin-nav-tab" id="mnAdmin" onclick="showPage('admin')" style="display:none">
+      <span class="mob-nav-badge" id="mobAdminBadge"></span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+      Admin
+    </button>
+  </div>
+</nav>
+
+</body>
+</html>

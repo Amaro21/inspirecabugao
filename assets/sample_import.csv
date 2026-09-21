@@ -1,0 +1,16 @@
+street_name,purok_name,house_number,house_lat,house_lng,first_name,middle_name,last_name,gender,age_group,birth_date
+San Antonio Street,Purok 1A,001,13.5960,124.2810,Juan,Santos,Dela Cruz,male,adult,1985-03-15
+San Antonio Street,Purok 1A,001,13.5960,124.2810,Maria,Reyes,Dela Cruz,female,adult,1988-07-22
+San Antonio Street,Purok 1A,001,13.5960,124.2810,Pedro,,Dela Cruz,male,child,2015-11-10
+San Antonio Street,Purok 1B,002,13.5955,124.2804,Roberto,Cruz,Garcia,male,adult,1972-05-30
+San Antonio Street,Purok 1B,002,13.5955,124.2804,Lourdes,Torres,Garcia,female,adult,1975-09-12
+Salvacion Street,Purok 2A,001,13.5982,124.2832,Antonio,Bautista,Reyes,male,adult,1965-12-01
+Salvacion Street,Purok 2A,001,13.5982,124.2832,Carmen,Villanueva,Reyes,female,adult,1968-04-18
+Salvacion Street,Purok 2B,002,13.5978,124.2838,Fernando,,Santos,male,adult,1980-08-14
+Salvacion Street,Purok 2B,002,13.5978,124.2838,Rosario,Mendoza,Santos,female,adult,1983-01-07
+San Roque Street,Purok 3A,001,13.5933,124.2793,Eduardo,Castillo,Villanueva,male,adult,1955-11-23
+San Roque Street,Purok 3A,001,13.5933,124.2793,Teresita,Ramos,Villanueva,female,adult,1958-06-30
+San Roque Street,Purok 3B,002,13.5972,124.2843,Manuel,Aquino,Cruz,male,adult,1978-04-29
+San Roque Street,Purok 3B,002,13.5972,124.2843,Gloria,Bautista,Cruz,female,adult,1981-12-16
+San Ramon Street,Purok 4A,001,13.5947,124.2852,Ernesto,Magsaysay,Torres,male,adult,1963-08-20
+San Ramon Street,Purok 4A,001,13.5947,124.2852,Remedios,Navarro,Torres,female,adult,1966-03-11

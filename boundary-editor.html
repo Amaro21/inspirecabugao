@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Boundary Editor — Barangay Cabugao</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  :root{
+    --ink:#111210; --ink-mid:#4a4d47; --ink-lt:#8a8e85;
+    --border:#e2e4df; --surface:#fff; --bg:#f7f8f5;
+    --green:#1f5c32; --green-dim:#2d7a46;
+    --r:6px; --r-lg:10px;
+    --shadow-md:0 4px 16px rgba(0,0,0,.10);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;font-family:'DM Sans',Arial,sans-serif;background:var(--bg);color:var(--ink)}
+  .layout{display:flex;height:100%}
+  #map{flex:1;height:100%}
+  .panel{
+    width:340px;flex-shrink:0;height:100%;overflow-y:auto;
+    background:var(--surface);border-left:1px solid var(--border);
+    padding:18px;display:flex;flex-direction:column;gap:14px;
+  }
+  .panel h1{font-size:1.05rem;margin:0 0 2px}
+  .panel .sub{font-size:.78rem;color:var(--ink-mid);margin:0}
+  .card{border:1px solid var(--border);border-radius:var(--r-lg);padding:12px;background:var(--bg)}
+  .card h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.3px;color:var(--ink-mid);margin:0 0 8px;font-weight:700}
+  .howto li{font-size:.80rem;color:var(--ink-mid);margin-bottom:6px;line-height:1.4}
+  .stat-row{display:flex;justify-content:space-between;font-size:.82rem;padding:4px 0}
+  .stat-row b{color:var(--ink)}
+  textarea{
+    width:100%;min-height:150px;resize:vertical;
+    font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.74rem;line-height:1.5;
+    border:1.5px solid var(--border);border-radius:var(--r);padding:8px;color:var(--ink);
+  }
+  .btn{
+    display:inline-flex;align-items:center;justify-content:center;gap:6px;
+    border:none;border-radius:var(--r);padding:9px 14px;font-size:.82rem;font-weight:600;
+    cursor:pointer;font-family:inherit;width:100%;
+  }
+  .btn-primary{background:var(--green);color:#fff}
+  .btn-primary:hover{background:var(--green-dim)}
+  .btn-secondary{background:#fff;color:var(--ink);border:1.5px solid var(--border)}
+  .btn-secondary:hover{border-color:var(--ink-lt)}
+  .btn-row{display:flex;gap:8px}
+  .btn-row .btn{flex:1}
+  .toggle-row{display:flex;gap:2px;background:#fff;border:1px solid var(--border);border-radius:var(--r);padding:3px}
+  .toggle-row button{flex:1;background:none;border:none;border-radius:4px;padding:6px;font-size:.76rem;font-weight:600;cursor:pointer;font-family:inherit;color:var(--ink-mid)}
+  .toggle-row button.active{background:var(--green);color:#fff}
+  .copied-msg{font-size:.74rem;color:var(--green);font-weight:600;height:16px}
+  .pin-label{
+    background:var(--green);color:#fff;border:2px solid #fff;border-radius:50%;
+    width:22px;height:22px;display:flex;align-items:center;justify-content:center;
+    font-size:.68rem;font-weight:700;box-shadow:0 1px 4px rgba(0,0,0,.35);
+  }
+  .del-popup button{
+    background:#c0392b;color:#fff;border:none;border-radius:5px;padding:6px 10px;
+    font-size:.76rem;font-weight:600;cursor:pointer;font-family:inherit;
+  }
+  @media (max-width:760px){
+    .layout{flex-direction:column}
+    #map{height:55%}
+    .panel{width:100%;height:45%;border-left:none;border-top:1px solid var(--border)}
+  }
+</style>
+</head>
+<body>
+
+<div class="layout">
+  <div id="map"></div>
+  <div class="panel">
+    <div>
+      <h1>Boundary Editor</h1>
+      <p class="sub">Barangay Cabugao, Bato, Catanduanes — temporary tool, delete this file once you're done.</p>
+    </div>
+
+    <div class="card">
+      <h2>How to use</h2>
+      <ul class="howto" style="margin:0;padding-left:18px">
+        <li>Drag a numbered pin to move that point.</li>
+        <li>Click empty ground to add a new point on the nearest edge.</li>
+        <li>Click a pin, then "Remove" to delete it.</li>
+        <li>Copy the array below into <code>BRGY.polygon</code> in <code>core.js</code> when you're happy with the shape.</li>
+      </ul>
+    </div>
+
+    <div class="toggle-row">
+      <button id="btnStreet" class="active" onclick="setBaseLayer('street')">Map</button>
+      <button id="btnSat" onclick="setBaseLayer('satellite')">Satellite</button>
+    </div>
+
+    <div class="card">
+      <h2>Shape</h2>
+      <div class="stat-row"><span>Points</span><b id="statCount">–</b></div>
+      <div class="stat-row"><span>Suggested center</span><b id="statCenter">–</b></div>
+      <div class="stat-row"><span>Bounding box (sw)</span><b id="statSw">–</b></div>
+      <div class="stat-row"><span>Bounding box (ne)</span><b id="statNe">–</b></div>
+    </div>
+
+    <div class="card">
+      <h2>BRGY.polygon — ready to paste</h2>
+      <textarea id="output" readonly></textarea>
+      <div class="btn-row" style="margin-top:8px">
+        <button class="btn btn-primary" onclick="copyOutput()">Copy</button>
+        <button class="btn btn-secondary" onclick="resetPoints()">Reset to current</button>
+      </div>
+      <div class="copied-msg" id="copiedMsg"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// Starting values — copied from BRGY in assets/js/modules/core.js as of
+// the last time this tool was generated. Edit START.polygon below if
+// core.js has moved on since, then reload.
+const START = {
+  lat: 13.5961, lng: 124.2807, zoom: 18,
+  polygon: [
+    [13.6085,124.2695],[13.6090,124.2790],[13.6075,124.2875],
+    [13.6048,124.2940],[13.6005,124.2948],[13.5960,124.2932],
+    [13.5918,124.2908],[13.5872,124.2878],[13.5845,124.2830],
+    [13.5840,124.2778],[13.5857,124.2710],[13.5902,124.2684],
+    [13.5952,124.2679],[13.6012,124.2681],[13.6058,124.2688],
+    [13.6085,124.2695]
+  ]
+};
+
+const map = L.map('map').setView([START.lat, START.lng], START.zoom);
+const tileStreet = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'© OpenStreetMap', maxZoom:20 }).addTo(map);
+const tileSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution:'© Esri', maxZoom:20 });
+
+function setBaseLayer(type) {
+  if (type === 'satellite') { map.removeLayer(tileStreet); tileSat.addTo(map); }
+  else { map.removeLayer(tileSat); tileStreet.addTo(map); }
+  document.getElementById('btnStreet').classList.toggle('active', type==='street');
+  document.getElementById('btnSat').classList.toggle('active', type==='satellite');
+}
+
+let markers = [];   // ordered array of L.marker, one per polygon vertex
+let polyline = null;
+
+function numberIcon(n) {
+  return L.divIcon({ className:'', html:`<div class="pin-label">${n}</div>`, iconSize:[22,22], iconAnchor:[11,11] });
+}
+
+function renumber() {
+  markers.forEach((m, i) => m.setIcon(numberIcon(i + 1)));
+}
+
+function removePoint(marker) {
+  if (markers.length <= 3) { alert('A boundary needs at least 3 points.'); return; }
+  map.removeLayer(marker);
+  markers = markers.filter(m => m !== marker);
+  renumber();
+  redraw();
+}
+
+function addMarker(lat, lng, atIndex) {
+  const marker = L.marker([lat, lng], { draggable: true, icon: numberIcon(markers.length + 1) });
+  marker.on('drag', redraw);
+  marker.on('click', L.DomEvent.stopPropagation);
+  marker.bindPopup(`<div class="del-popup"><button onclick="removePoint(_editorMarkerById('${L.stamp(marker)}'))">Remove point</button></div>`);
+  marker.addTo(map);
+  if (atIndex === undefined || atIndex >= markers.length) markers.push(marker);
+  else markers.splice(atIndex, 0, marker);
+  renumber();
+  return marker;
+}
+
+// Popup HTML above is built before the marker's Leaflet id is guaranteed
+// stable across re-renders, so look the marker up by id at click time
+// rather than closing over the marker reference directly.
+function _editorMarkerById(id) {
+  return markers.find(m => String(L.stamp(m)) === String(id));
+}
+
+// Perpendicular distance from a point to a line segment, in plain
+// lat/lng space — the boundary is small enough (under 1km across) that
+// a flat-plane approximation is accurate enough for picking "nearest edge".
+function distToSegment(p, a, b) {
+  const dx = b.lng - a.lng, dy = b.lat - a.lat;
+  const lenSq = dx*dx + dy*dy;
+  let t = lenSq === 0 ? 0 : ((p.lng - a.lng)*dx + (p.lat - a.lat)*dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  const projLng = a.lng + t*dx, projLat = a.lat + t*dy;
+  return Math.hypot(p.lng - projLng, p.lat - projLat);
+}
+
+function nearestEdgeIndex(latlng) {
+  let best = 0, bestDist = Infinity;
+  for (let i = 0; i < markers.length; i++) {
+    const a = markers[i].getLatLng();
+    const b = markers[(i + 1) % markers.length].getLatLng();
+    const d = distToSegment(latlng, a, b);
+    if (d < bestDist) { bestDist = d; best = i; }
+  }
+  return best + 1; // insert right after the closer endpoint of the nearest edge
+}
+
+function redraw() {
+  const latlngs = markers.map(m => m.getLatLng());
+  if (polyline) map.removeLayer(polyline);
+  polyline = L.polygon(latlngs, { color:'#1f5c32', weight:3, fillColor:'#1f5c32', fillOpacity:0.06, dashArray:'8 5' }).addTo(map);
+  updateOutput(latlngs);
+}
+
+function updateOutput(latlngs) {
+  const r4 = n => Math.round(n * 10000) / 10000;
+  const pts = latlngs.map(p => [r4(p.lat), r4(p.lng)]);
+
+  document.getElementById('statCount').textContent = pts.length;
+
+  const lats = pts.map(p => p[0]), lngs = pts.map(p => p[1]);
+  const sw = { lat: Math.min(...lats), lng: Math.min(...lngs) };
+  const ne = { lat: Math.max(...lats), lng: Math.max(...lngs) };
+  document.getElementById('statSw').textContent = `${sw.lat}, ${sw.lng}`;
+  document.getElementById('statNe').textContent = `${ne.lat}, ${ne.lng}`;
+  document.getElementById('statCenter').textContent =
+    `${r4((sw.lat+ne.lat)/2)}, ${r4((sw.lng+ne.lng)/2)}`;
+
+  const lines = [];
+  for (let i = 0; i < pts.length; i += 3) {
+    lines.push(pts.slice(i, i + 3).map(p => `[${p[0]},${p[1]}]`).join(','));
+  }
+  document.getElementById('output').value = lines.join(',\n');
+}
+
+function resetPoints() {
+  markers.forEach(m => map.removeLayer(m));
+  markers = [];
+  START.polygon.forEach(([lat, lng]) => addMarker(lat, lng));
+  redraw();
+  document.getElementById('copiedMsg').textContent = '';
+}
+
+function copyOutput() {
+  const ta = document.getElementById('output');
+  ta.select();
+  navigator.clipboard.writeText(ta.value).then(() => {
+    document.getElementById('copiedMsg').textContent = 'Copied!';
+    setTimeout(() => document.getElementById('copiedMsg').textContent = '', 1800);
+  });
+}
+
+map.on('click', (e) => {
+  const insertAt = markers.length >= 3 ? nearestEdgeIndex(e.latlng) : markers.length;
+  addMarker(e.latlng.lat, e.latlng.lng, insertAt);
+  redraw();
+});
+
+resetPoints();
+</script>
+</body>
+</html>

@@ -1,0 +1,2497 @@
+// INSPIRE – Barangay Cabugao SpotMap
+const API = 'api/index.php';
+
+// ── Correct coordinates: Barangay Cabugao, Bato, Catanduanes ──
+// Center: 13.5961, 124.2807 (PhilAtlas / PSA verified)
+// Land area: 178.895 hectares; bounded by Cabugao Bay (south),
+// Barangay Sipi (north), San Andres (east), Binanuahan (west)
+const BRGY = {
+  lat: 13.5961, lng: 124.2807, zoom: 18,
+  minZoom: 18, maxZoom: 20,
+  // Bounding box tightly wrapping the 178-ha barangay
+  swLat: 13.5840, swLng: 124.2680,
+  neLat: 13.6090, neLng: 124.2950,
+  // Approximate boundary polygon (clockwise from NW)
+  polygon: [
+    [13.6085,124.2695],[13.6090,124.2790],[13.6075,124.2875],
+    [13.6048,124.2940],[13.6005,124.2948],[13.5960,124.2932],
+    [13.5918,124.2908],[13.5872,124.2878],[13.5845,124.2830],
+    [13.5840,124.2778],[13.5857,124.2710],[13.5902,124.2684],
+    [13.5952,124.2679],[13.6012,124.2681],[13.6058,124.2688],
+    [13.6085,124.2695]
+  ]
+};
+
+// ===================== MAP INIT =====================
+let map, tileStreet, tileSat, curLayer = 'street';
+let markers = { streets:[], houses:[], facilities:[], incidents:[] };
+
+function initMap() {
+  const bounds = L.latLngBounds(
+    L.latLng(BRGY.swLat, BRGY.swLng),
+    L.latLng(BRGY.neLat, BRGY.neLng)
+  );
+
+  // On small screens, open one zoom level out (17 instead of 18) so more of
+  // the barangay is visible at once on a cramped viewport.
+  const mobileView = window.innerWidth <= 700;
+  const startZoom = mobileView ? 17 : BRGY.zoom;
+  const minZoomLevel = mobileView ? 17 : BRGY.minZoom;
+
+  map = L.map('map', {
+    zoomControl:         true,
+    minZoom:             minZoomLevel,
+    maxZoom:             BRGY.maxZoom,
+    maxBounds:           bounds,
+    maxBoundsViscosity:  1.0   // hard boundary — snaps back instantly
+  }).setView([BRGY.lat, BRGY.lng], startZoom); // always open centered on Cabugao
+
+  tileStreet = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'© OpenStreetMap', maxZoom:20 });
+  tileSat    = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution:'© Esri', maxZoom:20 });
+  tileStreet.addTo(map);
+
+  // Barangay boundary polygon overlay
+  L.polygon(BRGY.polygon, {
+    color:'#1a6b3a', weight:3, opacity:0.95,
+    fillColor:'#1a6b3a', fillOpacity:0.08, dashArray:'8 5'
+  }).addTo(map);
+
+  // Darken area OUTSIDE the barangay (mask effect)
+  const world = [[90,-180],[90,180],[-90,180],[-90,-180]];
+  L.polygon([world, BRGY.polygon], {
+    color:'transparent', fillColor:'#000', fillOpacity:0.18,
+    interactive:false
+  }).addTo(map);
+
+  loadMapData();
+}
+
+function setLayer(type) {
+  if (type === 'satellite') { map.removeLayer(tileStreet); tileSat.addTo(map); }
+  else { map.removeLayer(tileSat); tileStreet.addTo(map); }
+  curLayer = type;
+  qs('#btnStreet').classList.toggle('active', type==='street');
+  qs('#btnSat').classList.toggle('active', type==='satellite');
+}
+
+// Detects a small/mobile viewport so map markers and zoom can scale down to
+// stay legible and uncluttered on a cramped screen.
+function isMobileScreen() { return window.innerWidth <= 700; }
+
+function loadMapData() {
+  api('map_data').then(d => {
+    clearAllMarkers();
+    const u = currentUser();
+    const isOff = isStaff(u);
+    const mob = isMobileScreen();
+    // Streets
+    (d.streets||[]).forEach(s => {
+      if (!s.lat||!s.lng) return;
+      // Label shows street name (abbreviated to fit), not population number
+      const shortName = s.name.replace(/(Street|St\.?|Avenue|Ave\.?|Road|Rd\.?)$/i,'').trim();
+      const ic = L.divIcon({
+        className:'',
+        html:`<div style="background:#0f4a27;color:#fff;border-radius:6px;padding:${mob?'2px 5px':'3px 7px'};font-size:${mob?7:9}px;font-weight:800;box-shadow:0 2px 8px rgba(0,0,0,.35);border:1px solid #4caf73;white-space:nowrap;max-width:${mob?70:90}px;overflow:hidden;text-overflow:ellipsis">${shortName}</div>`,
+        iconSize:null, iconAnchor:[0,0]
+      });
+      const m = L.marker([+s.lat,+s.lng],{icon:ic}).addTo(map);
+      m.bindPopup(`
+        <div class="popup-title">${s.name}</div>
+        <div class="popup-meta">🏠 <strong>${s.house_count||0}</strong> households &nbsp;·&nbsp; 👥 <strong>${s.population||0}</strong> residents</div>
+        <div class="popup-meta">♂ ${s.males||0} male &nbsp;·&nbsp; ♀ ${s.females||0} female</div>
+        <div class="popup-meta">👶 ${s.children||0} children &nbsp;·&nbsp; 👴 ${s.seniors||0} seniors</div>
+        ${(s.pwd_count>0)?`<div class="popup-meta">♿ <strong>${s.pwd_count}</strong> PWD</div>`:''}
+      `);
+      markers.streets.push(m);
+    });
+    // Houses
+    (d.houses||[]).forEach(h => {
+      if (!h.lat||!h.lng) return;
+      // Officials: labelled number marker + clickable popup
+      // Visitors: plain dot, non-interactive (no number, no click)
+      const ic = isOff
+        ? L.divIcon({ className:'', html:`<div style="background:#f5a623;color:#333;border-radius:4px;padding:${mob?'1px 4px':'2px 5px'};font-size:${mob?7:9}px;font-weight:800;box-shadow:0 2px 4px rgba(0,0,0,.25);white-space:nowrap;border:1px solid #e09000">${h.house_number||'H'}</div>`, iconSize:null })
+        : L.divIcon({ className:'', html:`<div style="width:${mob?8:10}px;height:${mob?8:10}px;background:#f5a623;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3)"></div>`, iconSize:[mob?8:10,mob?8:10], iconAnchor:[mob?4:5,mob?4:5] });
+      const m = L.marker([+h.lat,+h.lng], {icon:ic, interactive:isOff}).addTo(map);
+      if (isOff) {
+        m.bindPopup(`<div class="popup-title">${h.house_name||h.house_number||'House'}</div><div class="popup-meta">📍 ${h.street_name} · 👥 ${h.member_count} members</div><button class="popup-btn" onclick="openHouseModal(${h.id})">View / Add Members</button>`);
+      }
+      markers.houses.push(m);
+    });
+    // Facilities
+    (d.facilities||[]).forEach(f => {
+      if (!f.lat||!f.lng) return;
+      const fSize = mob ? 22 : 28;
+      const ic = L.divIcon({ className:'', html:`<div style="background:#1565c0;color:#fff;border-radius:50%;width:${fSize}px;height:${fSize}px;display:flex;align-items:center;justify-content:center;font-size:${mob?11:13}px;box-shadow:0 2px 6px rgba(0,0,0,.3)">${facIcon(f.category)}</div>`, iconSize:[fSize,fSize], iconAnchor:[fSize/2,fSize/2] });
+      const m = L.marker([+f.lat,+f.lng],{icon:ic}).addTo(map);
+      m.bindPopup(`<div class="popup-title">${f.name}</div><div class="popup-meta">${facLabel(f.category)}</div>${f.description?`<div class="popup-meta">${f.description}</div>`:''}<button class="popup-btn popup-btn-sec" onclick="showPage('facilities')">View All Facilities</button>`);
+      markers.facilities.push(m);
+    });
+    // Incidents — officials see ALL (pending shown differently), residents see APPROVED only
+    const isOfficialOrAdmin = isOff;
+    (d.incidents||[]).forEach(i => {
+      if (!i.lat||!i.lng) return;
+      const isPending = i.approved != 1;
+      // Residents/public: skip unapproved
+      if (!isOfficialOrAdmin && isPending) return;
+
+      // Pending pin style (orange dashed, for officials only)
+      let pinHtml, pinSize;
+      const incSize = mob ? 24 : 30;
+      if (isPending) {
+        pinHtml = `<div style="background:#ff9800;color:#fff;border-radius:50%;width:${incSize}px;height:${incSize}px;display:flex;align-items:center;justify-content:center;font-size:${mob?12:15}px;box-shadow:0 2px 8px rgba(0,0,0,.4);border:3px dashed #fff;opacity:0.85;animation:pulse 1.6s infinite">${incIcon(i.category)}</div>`;
+        pinSize = [incSize,incSize];
+      } else {
+        pinHtml = `<div style="background:#e53935;color:#fff;border-radius:50%;width:${incSize}px;height:${incSize}px;display:flex;align-items:center;justify-content:center;font-size:${mob?12:15}px;box-shadow:0 2px 8px rgba(0,0,0,.4);border:2px solid #fff">${incIcon(i.category)}</div>`;
+        pinSize = [incSize,incSize];
+      }
+      const ic = L.divIcon({ className:'', html:pinHtml, iconSize:pinSize, iconAnchor:[incSize/2,incSize/2] });
+      const m = L.marker([+i.lat,+i.lng],{icon:ic}).addTo(map);
+      m.bindPopup(renderIncidentPopup(i, isOfficialOrAdmin), {maxWidth:270, minWidth:240});
+      markers.incidents.push(m);
+    });
+
+    // Puroks — render marker only if location is pinned
+    (d.puroks||[]).forEach(p => {
+      if (!p.lat||!p.lng) return;
+      const pSize = mob ? 26 : 32;
+      const ic = L.divIcon({
+        className: '',
+        html: `<div style="background:#7b3fa0;color:#fff;border-radius:50%;width:${pSize}px;height:${pSize}px;display:flex;align-items:center;justify-content:center;font-size:${mob?9:10}px;font-weight:800;box-shadow:0 2px 8px rgba(0,0,0,.35);border:2px solid #fff;text-align:center;line-height:1.1;padding:2px">${p.name.replace(/Purok /i,'').substring(0,5)}</div>`,
+        iconSize: [pSize,pSize], iconAnchor: [pSize/2,pSize/2]
+      });
+      const m = L.marker([+p.lat,+p.lng], {icon:ic}).addTo(map);
+      m.bindPopup(`
+        <div class="popup-title">🏘 ${p.name}</div>
+        ${p.description?`<div class="popup-meta" style="margin-bottom:6px">${p.description}</div>`:''}
+        <div class="popup-meta">🏠 <strong>${p.house_count||0}</strong> households &nbsp;·&nbsp; 👥 <strong>${p.population||0}</strong> residents</div>
+        <div class="popup-meta">♂ ${p.males||0} male &nbsp;·&nbsp; ♀ ${p.females||0} female</div>
+        <div class="popup-meta">👶 ${p.children||0} children &nbsp;·&nbsp; 👴 ${p.seniors||0} seniors</div>
+        <div class="popup-meta">♿ <strong>${p.pwd_count||0}</strong> PWD</div>
+      `);
+      markers.puroks.push(m);
+    });
+
+  });
+}
+
+function clearAllMarkers() {
+  Object.values(markers).forEach(arr => { arr.forEach(m => map.removeLayer(m)); });
+  markers = {streets:[],houses:[],facilities:[],incidents:[],puroks:[]};
+}
+
+// ===================== STREET HIGHLIGHT =====================
+let selectedStreetId = null;
+
+// Fetch road geometry from OpenStreetMap Overpass API and draw it
+function flyStreet(id) {
+  selectedStreetId = id;
+  qsa('.street-item').forEach(el => {
+    el.classList.toggle('selected', el.dataset.sid == id);
+  });
+
+  // Fly to street pin, or first house if no pin
+  api('streets').then(streets => {
+    const s = streets.find(x => x.id == id);
+    if (s && s.lat && s.lng) map.flyTo([+s.lat, +s.lng], 18);
+  });
+  api(`houses&street_id=${id}`).then(houses => {
+    const h = houses.find(x => x.lat && x.lng);
+    if (h) map.flyTo([+h.lat, +h.lng], 18);
+  });
+}
+
+// ===================== PIN MAPS =====================
+let pinMaps = {};
+let pinMarkers = {};
+
+function initPinMap(id, onPlace) {
+  const pinBounds = L.latLngBounds(
+    L.latLng(BRGY.swLat, BRGY.swLng),
+    L.latLng(BRGY.neLat, BRGY.neLng)
+  );
+  if (pinMaps[id]) {
+    pinMaps[id].invalidateSize();
+    pinMaps[id].setView([BRGY.lat, BRGY.lng], 17);
+    return;
+  }
+  const m = L.map(id, {
+    zoomControl:true, minZoom:14, maxZoom:19,
+    maxBounds: pinBounds, maxBoundsViscosity:1.0
+  }).setView([BRGY.lat, BRGY.lng], 17);
+
+  if (curLayer==='satellite') L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19}).addTo(m);
+  else L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(m);
+
+  // Boundary polygon removed intentionally
+
+  m.on('click',e=>{ const la=e.latlng.lat.toFixed(6),ln=e.latlng.lng.toFixed(6); placePinMap(id,la,ln,onPlace); });
+  pinMaps[id]=m;
+  setTimeout(()=>m.invalidateSize(),200);
+}
+
+function isInsideBrgy(lat, lng) {
+  return (+lat >= BRGY.swLat && +lat <= BRGY.neLat && +lng >= BRGY.swLng && +lng <= BRGY.neLng);
+}
+
+// OOB warning div IDs per map
+const OOB_IDS = { pinMap:'ahOob', facPinMap:'fOob', incPinMap:'iOob' };
+
+function placePinMap(mapId, lat, lng, onPlace) {
+  const pinIc = L.divIcon({className:'',html:`<div style="text-align:center"><div style="font-size:28px;filter:drop-shadow(0 2px 4px rgba(0,0,0,.4))">📍</div></div>`,iconSize:[30,36],iconAnchor:[15,34]});
+  if (pinMarkers[mapId]) pinMaps[mapId].removeLayer(pinMarkers[mapId]);
+  pinMarkers[mapId] = L.marker([+lat,+lng],{icon:pinIc,draggable:true}).addTo(pinMaps[mapId]);
+
+  // Show/hide OOB warning
+  const oobEl = document.getElementById(OOB_IDS[mapId]);
+  if (oobEl) oobEl.classList.toggle('show', !isInsideBrgy(lat, lng));
+
+  pinMarkers[mapId].on('dragend',function(){
+    const p=pinMarkers[mapId].getLatLng();
+    const la=p.lat.toFixed(6), ln=p.lng.toFixed(6);
+    if (oobEl) oobEl.classList.toggle('show', !isInsideBrgy(la, ln));
+    onPlace(la, ln);
+  });
+  onPlace(lat,lng);
+}
+
+function clearPinMap(mapId, onClear) {
+  if (pinMarkers[mapId]) { pinMaps[mapId].removeLayer(pinMarkers[mapId]); delete pinMarkers[mapId]; }
+  onClear();
+}
+
+// ===================== STATS =====================
+function loadStats() {
+  api('stats').then(d=>{
+    qs('#sPop').textContent=fmt(d.population);
+    qs('#sHouses').textContent=fmt(d.houses);
+    qs('#sStreets').textContent=fmt(d.streets);
+    qs('#sFacilities').textContent=fmt(d.facilities);
+    qs('#sIncidents').textContent=fmt(d.incidents);
+    qs('#sMales').textContent=fmt(d.males);
+    qs('#sFemales').textContent=fmt(d.females);
+    const sr=qs('#sSeniors'); if(sr) sr.textContent=fmt(d.seniors||0);
+    const pw=qs('#sPwd'); if(pw) pw.textContent=fmt(d.pwd||0);
+  });
+}
+
+// ===================== SIDEBAR =====================
+let curSidebarTab = 'streets-tab';
+function sidebarTab(tab) {
+  curSidebarTab = tab;
+  qsa('.stab').forEach((b,i)=>b.classList.toggle('active',['streets-tab','facilities-list','incidents-list'][i]===tab));
+  qs('#sbStreets').classList.toggle('hidden', tab!=='streets-tab');
+  qs('#sbFacilities').classList.toggle('hidden', tab!=='facilities-list');
+  qs('#sbIncidents').classList.toggle('hidden', tab!=='incidents-list');
+  if (tab==='streets-tab') loadStreetSidebar();
+  if (tab==='facilities-list') loadSidebarFacilities();
+  if (tab==='incidents-list') loadSidebarIncidents();
+}
+
+function loadStreetSidebar() {
+  qs('#streetList').innerHTML='<div class="loading-state">Loading...</div>';
+  api('streets').then(streets=>{
+    if (!streets.length){
+      qs('#streetList').innerHTML='<div class="empty-state" style="padding:24px 12px">No streets yet.<br><span class="hint">Admin can add streets via Dashboard.</span></div>';
+      return;
+    }
+    qs('#streetList').innerHTML=`
+      <div class="street-hint">Click a street to focus it on the map</div>
+      ${streets.map(s=>`
+      <div class="street-item ${selectedStreetId==s.id?'selected':''}" data-sid="${s.id}" onclick="flyStreet(${s.id})">
+        <div class="street-name">${s.name}</div>
+        <div class="street-meta">🏠 ${s.house_count} houses &nbsp;·&nbsp; 👥 ${s.population} residents</div>
+      </div>`).join('')}
+    `;
+  });
+}
+
+function loadSidebarFacilities() {
+  const cat=qs('#facCatFilter').value;
+  qs('#facilityList').innerHTML='<div class="loading-state">Loading...</div>';
+  api(`facilities${cat?'&category='+cat:''}`).then(facs=>{
+    if(!facs.length){qs('#facilityList').innerHTML='<div class="empty-state">No facilities.</div>';return;}
+    qs('#facilityList').innerHTML=facs.map(f=>`
+      <div class="fac-item" onclick="flyFacility(${f.lat},${f.lng})">
+        <div class="fac-name">${facIcon(f.category)} ${f.name}</div>
+        <div class="fac-cat">${facLabel(f.category)}</div>
+      </div>`).join('');
+  });
+}
+
+function loadSidebarIncidents() {
+  const st = qs('#incStatusFilter').value;
+  const u  = currentUser();
+  const isOff = isStaff(u);
+  qs('#incidentList').innerHTML = '<div class="loading-state">Loading...</div>';
+  api(`incidents${st?'&status='+st:''}`).then(incs => {
+    if (!incs.length) { qs('#incidentList').innerHTML = '<div class="empty-state">No incidents.</div>'; return; }
+    qs('#incidentList').innerHTML = incs.map(i => `
+      <div class="inc-item" onclick="${isOff ? `openIncManage(${i.id})` : ''}">
+        <div class="inc-title">${incIcon(i.category)} ${i.title}</div>
+        <div class="inc-meta">
+          <span class="badge sev-${i.severity}">${i.severity}</span>
+          <span class="badge st-${i.status}">${i.status}</span>
+          ${i.approved==1
+            ? '<span class="badge" style="background:#e8f5e9;color:#2e7d32;font-size:.65rem">✅ On Map</span>'
+            : '<span class="badge" style="background:#fff3e0;color:#e65100;font-size:.65rem">⏳ Pending</span>'}
+        </div>
+      </div>`).join('');
+  });
+}
+
+function flyFacility(lat,lng) {
+  if(lat&&lng) map.flyTo([+lat,+lng],18);
+}
+
+// ===================== POPULATION PAGE =====================
+function loadPopulationPage() {
+  qs('#popContent').innerHTML='<div class="loading-state">Loading...</div>';
+  api('streets').then(streets=>{
+    if(!streets.length){qs('#popContent').innerHTML='<div class="empty-state">No data yet.</div>';return;}
+    qs('#popContent').innerHTML=`<div class="pop-grid">${streets.map(s=>`
+      <div class="pop-card">
+        <div class="pop-card-hd"><h4>${s.name}</h4><p>🏠 ${s.house_count} households</p></div>
+        <div class="pop-card-bd">
+          <div class="pop-stat"><span>Total Population</span><span class="pop-stat-val pop-total">${s.population}</span></div>
+          <div class="pop-stat"><span>Households</span><span class="pop-stat-val">${s.house_count}</span></div>
+          <div class="section-lbl">Households</div>
+          <div id="hm-${s.id}"><div class="hint" style="padding:6px">Click to load</div></div>
+          <button class="btn-secondary mt-2" style="width:100%;font-size:.76rem;padding:5px" onclick="loadHousesMini(${s.id})">Load Houses</button>
+        </div>
+      </div>`).join('')}</div>`;
+  });
+}
+
+function loadHousesMini(sid) {
+  const c=qs(`#hm-${sid}`);
+  c.innerHTML='<div class="loading-state" style="padding:8px">Loading...</div>';
+  api(`houses&street_id=${sid}`).then(houses=>{
+    if(!houses.length){c.innerHTML='<div class="hint" style="padding:6px">No houses yet.</div>';return;}
+    c.innerHTML=houses.map(h=>`
+      <div class="house-mini" onclick="openHouseModal(${h.id})">
+        <span>${h.house_number?'#'+h.house_number+' ':''}${h.house_name||'House'}</span>
+        <span class="hmcount">👥 ${h.member_count}</span>
+      </div>`).join('');
+  });
+}
+
+// ===================== HOUSE MODAL =====================
+function openHouseModal(id) {
+  qs('#houseMTitle').textContent='Loading...';
+  qs('#houseMBody').innerHTML='<div class="loading-state">Loading...</div>';
+  openModal('houseModal');
+  api(`house_detail&id=${id}`).then(h=>{
+    const u=currentUser();
+    const canEdit=isStaff(u);
+    const houseLabel = h.house_number ? `#${h.house_number}` : (h.house_name || 'House');
+    const purokLabel = h.purok_name ? ` · ${h.purok_name}` : '';
+    qs('#houseMTitle').textContent=`${houseLabel} — ${h.street_name}${purokLabel}`;
+    qs('#houseMBody').innerHTML=`
+      <div class="house-stats-row">
+        <div class="hstat"><div class="hstat-num">${h.member_count}</div><div class="hstat-lbl">Total</div></div>
+        <div class="hstat"><div class="hstat-num">${h.males||0}</div><div class="hstat-lbl">Male</div></div>
+        <div class="hstat"><div class="hstat-num">${h.females||0}</div><div class="hstat-lbl">Female</div></div>
+        <div class="hstat"><div class="hstat-num">${h.adults||0}</div><div class="hstat-lbl">Adults</div></div>
+        <div class="hstat"><div class="hstat-num">${h.children||0}</div><div class="hstat-lbl">Children</div></div>
+      </div>
+      ${canEdit?`<div style="display:flex;gap:6px;margin-bottom:10px">
+        <button class="btn-edit" onclick="openEditHouseModal(${h.id})">✏ Edit House</button>
+        ${isSuperAdminUser(u)?`<button class="btn-del" onclick="deleteHouse(${h.id})">🗑 Delete House</button>`:''}
+      </div>`:''}
+      <div class="section-lbl">Members (${h.member_count})</div>
+      <div id="membersList">${renderMembers(h.members,h.id,canEdit)}</div>
+      ${canEdit?`<div class="add-member-form">
+        <h4>+ Add New Member</h4>
+        <div class="form-row">
+          <div class="form-group"><label>First Name *</label><input type="text" id="mFn" class="form-control" placeholder="Juan"></div>
+          <div class="form-group"><label>Middle Name</label><input type="text" id="mMn" class="form-control" placeholder="Santos"></div>
+        </div>
+        <div class="form-group"><label>Last Name *</label><input type="text" id="mLn" class="form-control" placeholder="Dela Cruz"></div>
+        <div class="form-row">
+          <div class="form-group"><label>Gender *</label>
+            <div class="radio-group">
+              <label class="radio-opt"><input type="radio" name="mGen" value="male"> Male</label>
+              <label class="radio-opt"><input type="radio" name="mGen" value="female"> Female</label>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Date of Birth *</label>
+            <input type="date" id="mBirth" class="form-control" onchange="showAgePreview()">
+            <div id="mAgePreview" style="font-size:.76rem;color:#1f5c32;margin-top:4px;font-weight:600"></div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="radio-opt" style="gap:8px">
+            <input type="checkbox" id="mPwd" style="width:15px;height:15px;accent-color:#1f5c32">
+            <span>Person with Disability (PWD)</span>
+          </label>
+        </div>
+        <div id="mErr" class="err-msg" style="display:none"></div>
+        <button class="btn-primary" onclick="submitMember(${h.id})">Add Member</button>
+      </div>`:''}`;
+  });
+}
+
+function renderMembers(members,houseId,canEdit) {
+  if(!members||!members.length) return '<div class="empty-state" style="padding:12px">No members yet.</div>';
+  return members.map(m=>{
+    const ag = m.birth_date ? calcAgeGroup(m.birth_date) : m.age_group;
+    const age = m.birth_date ? calcAge(m.birth_date) : '?';
+    const agLabel = ag==='senior'?'👴 Senior Citizen':ag==='child'?'👶 Child':'🧑 Adult';
+    const pwdTag = m.is_pwd==1?'<span class="tag" style="background:#fff3e0;color:#e65100">♿ PWD</span>':'';
+    return `
+    <div class="member-card" id="mc-${m.id}">
+      <div style="flex:1">
+        <div class="member-name">${m.last_name}, ${m.first_name}${m.middle_name?' '+m.middle_name.charAt(0)+'.':''}</div>
+        <div class="member-tags">
+          <span class="tag tag-${m.gender}">${m.gender}</span>
+          <span class="tag tag-${ag}">${agLabel}</span>
+          ${pwdTag}
+          ${m.birth_date?`<span class="tag" style="background:#f0f0f0;color:#555">${age} yrs</span>`:''}
+        </div>
+      </div>
+      ${canEdit?`<div class="edit-btns">
+        <button class="btn-edit" onclick="openEditMember(${JSON.stringify(m).replace(/"/g,'&quot;')},${houseId})">✏</button>
+        <button class="btn-del" onclick="deleteMember(${m.id},${houseId})">✕</button>
+      </div>`:''}
+    </div>`;
+  }).join('');
+}
+
+function showAgePreview() {
+  const b=qs('#mBirth').value;
+  const p=qs('#mAgePreview');
+  if(!b){p.textContent='';return;}
+  const age=calcAge(b);
+  const label=calcAgeGroup(b);
+  const icons={child:'👶 Child',adult:'🧑 Adult',senior:'👴 Senior Citizen'};
+  p.textContent=`Age ${age} — ${icons[label]}`;
+}
+
+function submitMember(houseId) {
+  const fn=qs('#mFn').value.trim(),mn=qs('#mMn').value.trim(),ln=qs('#mLn').value.trim();
+  const gen=qs('input[name="mGen"]:checked')?.value;
+  const birth=qs('#mBirth').value;
+  const pwd=qs('#mPwd')?.checked?1:0;
+  const e=qs('#mErr');
+  if(!fn||!ln){e.textContent='First and last name required.';e.style.display='block';return;}
+  if(!gen){e.textContent='Select gender.';e.style.display='block';return;}
+  if(!birth){e.textContent='Date of birth is required.';e.style.display='block';return;}
+  e.style.display='none';
+  apiPost('member_add',{house_id:houseId,first_name:fn,middle_name:mn,last_name:ln,gender:gen,birth_date:birth,is_pwd:pwd}).then(r=>{
+    if(r.error){e.textContent=r.error;e.style.display='block';return;}
+    openHouseModal(houseId);loadStats();
+  });
+}
+
+function openEditMember(m, houseId) {
+  const fn=prompt('First name:',m.first_name); if(!fn) return;
+  const ln=prompt('Last name:',m.last_name)||m.last_name;
+  const mn=prompt('Middle name (leave blank if none):',m.middle_name||'')||'';
+  const gen=prompt('Gender (male/female):',m.gender)||m.gender;
+  const birth=prompt('Date of birth (YYYY-MM-DD):',m.birth_date||'');
+  if(!birth){alert('Date of birth is required.');return;}
+  const isPwd=confirm('Is this person a PWD (Person with Disability)?');
+  const age=calcAgeGroup(birth);
+  if(!['male','female'].includes(gen)||!['adult','child'].includes(age)){alert('Invalid gender or age group.');return;}
+  apiPost('member_edit',{id:m.id,first_name:fn,middle_name:mn,last_name:ln,gender:gen,age_group:age,birth_date:birth,is_pwd:isPwd?1:0}).then(r=>{
+    if(r.success) openHouseModal(houseId);
+  });
+}
+
+function deleteMember(id,houseId) {
+  if(!confirm('Remove this member?')) return;
+  apiPost('member_delete',{id}).then(r=>{ if(r.success){openHouseModal(houseId);loadStats();}});
+}
+
+function deleteHouse(id) {
+  if(!confirm('Delete this house and ALL its members? This cannot be undone.')) return;
+  apiPost('house_delete',{id}).then(r=>{if(r.success){closeModal('houseModal');loadMapData();loadStats();loadStreetSidebar();toast('House deleted.');}});
+}
+
+// ===================== ADD/EDIT HOUSE =====================
+let editingHouseId = null;
+
+function openAddHouseModal() {
+  const u=currentUser();
+  if(!isStaff(u)){openModal('loginModal');return;}
+  editingHouseId=null;
+  qs('#addHouseTitle').textContent='📍 Add New House';
+  qs('#ahStreet').innerHTML='<option value="">Select street...</option>';
+  qs('#ahPurok').innerHTML='<option value="">Select a street first...</option>';
+  qs('#ahNum').value='';qs('#ahName').value='';qs('#ahLat').value='';qs('#ahLng').value='';qs('#ahId').value='';
+  qs('#ahErr').style.display='none';
+  resetPinUI('pinInfo','pinEmpty');
+  loadAllStreets('ahStreet');
+  openModal('addHouseModal');
+  setTimeout(()=>initPinMap('pinMap',(la,ln)=>{qs('#ahLat').value=la;qs('#ahLng').value=ln;qs('#pinCoord').textContent=`${la}, ${ln}`;qs('#pinInfo').style.display='flex';qs('#pinEmpty').style.display='none';}),150);
+}
+
+function openEditHouseModal(id) {
+  api(`house_detail&id=${id}`).then(h=>{
+    editingHouseId=id;
+    qs('#addHouseTitle').textContent='✏ Edit House';
+    qs('#ahId').value=id;
+    qs('#ahNum').value=h.house_number||'';
+    qs('#ahLat').value=h.lat||'';
+    qs('#ahLng').value=h.lng||'';
+    qs('#ahErr').style.display='none';
+    // Load streets then pre-select the current one
+    api('streets').then(streets=>{
+      qs('#ahStreet').innerHTML='<option value="">Select street...</option>'+
+        streets.map(s=>`<option value="${s.id}" ${s.id==h.street_id?'selected':''}>${s.name}</option>`).join('');
+    });
+    // Load puroks scoped to this house's street, pre-selecting the current purok
+    loadPuroksForStreet(h.street_id, 'ahPurok', h.purok_id);
+    openModal('addHouseModal');
+    setTimeout(()=>{
+      initPinMap('pinMap',(la,ln)=>{qs('#ahLat').value=la;qs('#ahLng').value=ln;qs('#pinCoord').textContent=`${la}, ${ln}`;qs('#pinInfo').style.display='flex';qs('#pinEmpty').style.display='none';});
+      if(h.lat&&h.lng) placePinMap('pinMap',h.lat,h.lng,(la,ln)=>{qs('#ahLat').value=la;qs('#ahLng').value=ln;qs('#pinCoord').textContent=`${la}, ${ln}`;qs('#pinInfo').style.display='flex';qs('#pinEmpty').style.display='none';});
+    },150);
+    closeModal('houseModal');
+  });
+}
+
+function clearPin() {
+  clearPinMap('pinMap',()=>{resetPinUI('pinInfo','pinEmpty');qs('#ahLat').value='';qs('#ahLng').value='';});
+}
+
+function submitHouse() {
+  const sid=qs('#ahStreet').value,num=qs('#ahNum').value.trim();
+  const lat=qs('#ahLat').value,lng=qs('#ahLng').value,id=qs('#ahId').value;
+  const e=qs('#ahErr');
+  const pid=qs('#ahPurok').value;
+  if(!sid){e.textContent='Please select a street.';e.style.display='block';return;}
+  if(!pid){e.textContent='Please select a purok.';e.style.display='block';return;}
+  if(!num){e.textContent='House number is required.';e.style.display='block';return;}
+  e.style.display='none';
+  const action=editingHouseId?'house_edit':'house_add';
+  const data={purok_id:pid,house_number:num,house_name:'',lat:lat||null,lng:lng||null};
+  if(editingHouseId) data.id=editingHouseId;
+  apiPost(action,data).then(r=>{
+    if(r.error){e.textContent=r.error;e.style.display='block';return;}
+    closeModal('addHouseModal');
+    loadMapData();loadStats();loadStreetSidebar();
+    if(lat&&lng) map.flyTo([+lat,+lng],18);
+    toast(editingHouseId?'✅ House updated!':'✅ House added! Click the marker to add members.');
+    editingHouseId=null;
+  });
+}
+
+// ===================== FACILITIES PAGE =====================
+let allFacilities = [];
+function loadFacilitiesPage() {
+  qs('#facilitiesGrid').innerHTML='<div class="loading-state">Loading...</div>';
+  api('facilities').then(facs=>{
+    allFacilities=facs;
+    renderFacilities(facs);
+  });
+  // Show add button for officials
+  const u=currentUser();
+  if(isStaff(u)) qs('#addFacilityPageBtn').style.display='';
+  else qs('#addFacilityPageBtn').style.display='none';
+}
+
+function filterFacilitiesPage(cat) {
+  qsa('.cat-pill').forEach(b=>b.classList.remove('active'));
+  event.target.classList.add('active');
+  renderFacilities(cat?allFacilities.filter(f=>f.category===cat):allFacilities);
+}
+
+function renderFacilities(facs) {
+  const u=currentUser(); const canEdit=isStaff(u);
+  if(!facs.length){qs('#facilitiesGrid').innerHTML='<div class="empty-state">No facilities found.</div>';return;}
+  qs('#facilitiesGrid').innerHTML=`<div class="fac-grid">${facs.map(f=>`
+    <div class="fac-card" onclick="flyFacility(${f.lat},${f.lng});showPage('map')">
+      <div class="fac-card-hd">
+        <div class="fac-icon">${facIcon(f.category)}</div>
+        <div><div class="fac-card-name">${f.name}</div><div class="fac-card-cat">${facLabel(f.category)}</div></div>
+      </div>
+      <div class="fac-card-bd">
+        ${f.description?`<p>📝 ${f.description}</p>`:''}
+        ${f.address?`<p>📍 ${f.address}</p>`:''}
+        ${f.contact?`<p>📞 ${f.contact}</p>`:''}
+        ${f.operating_hours?`<p>🕐 ${f.operating_hours}</p>`:''}
+        ${canEdit?`<div style="margin-top:6px;display:flex;gap:6px" onclick="event.stopPropagation()">
+          <button class="btn-edit" onclick="openEditFacility(${f.id})">✏ Edit</button>
+          ${isSuperAdminUser(u)?`<button class="btn-del" onclick="deleteFacility(${f.id})">🗑 Delete</button>`:''}
+        </div>`:''}
+      </div>
+    </div>`).join('')}</div>`;
+}
+
+function openFacilityModal(editId) {
+  const u=currentUser();
+  if(!isStaff(u)){openModal('loginModal');return;}
+  qs('#facilityModalTitle').textContent=editId?'✏ Edit Facility':'🏛 Add Facility';
+  qs('#fId').value=editId||'';qs('#fName').value='';qs('#fCat').value='government';qs('#fDesc').value='';
+  qs('#fAddr').value='';qs('#fContact').value='';qs('#fHours').value='';qs('#fLat').value='';qs('#fLng').value='';
+  qs('#fErr').style.display='none';
+  resetPinUI('facPinInfo','facPinEmpty');
+  openModal('facilityModal');
+  setTimeout(()=>initPinMap('facPinMap',(la,ln)=>{qs('#fLat').value=la;qs('#fLng').value=ln;qs('#facPinCoord').textContent=`${la}, ${ln}`;qs('#facPinInfo').style.display='flex';qs('#facPinEmpty').style.display='none';}),150);
+}
+
+function openEditFacility(id) {
+  const f=allFacilities.find(x=>x.id==id);
+  if(!f) return;
+  openFacilityModal(id);
+  setTimeout(()=>{
+    qs('#fName').value=f.name;qs('#fCat').value=f.category;qs('#fDesc').value=f.description||'';
+    qs('#fAddr').value=f.address||'';qs('#fContact').value=f.contact||'';qs('#fHours').value=f.operating_hours||'';
+    qs('#fLat').value=f.lat||'';qs('#fLng').value=f.lng||'';
+    if(f.lat&&f.lng) placePinMap('facPinMap',f.lat,f.lng,(la,ln)=>{qs('#fLat').value=la;qs('#fLng').value=ln;qs('#facPinCoord').textContent=`${la}, ${ln}`;qs('#facPinInfo').style.display='flex';qs('#facPinEmpty').style.display='none';});
+  },300);
+}
+
+function clearFacPin(){clearPinMap('facPinMap',()=>{resetPinUI('facPinInfo','facPinEmpty');qs('#fLat').value='';qs('#fLng').value=''});}
+
+function submitFacility() {
+  const name=qs('#fName').value.trim(),cat=qs('#fCat').value,id=qs('#fId').value;
+  const e=qs('#fErr');
+  if(!name||!cat){e.textContent='Name and category required.';e.style.display='block';return;}
+  e.style.display='none';
+  const data={name,category:cat,description:qs('#fDesc').value.trim(),address:qs('#fAddr').value.trim(),contact:qs('#fContact').value.trim(),operating_hours:qs('#fHours').value.trim(),lat:qs('#fLat').value||null,lng:qs('#fLng').value||null};
+  if(id) data.id=id;
+  apiPost(id?'facility_edit':'facility_add',data).then(r=>{
+    if(r.error){e.textContent=r.error;e.style.display='block';return;}
+    closeModal('facilityModal');loadFacilitiesPage();loadMapData();loadStats();
+    toast(id?'✅ Facility updated!':'✅ Facility added!');
+  });
+}
+
+function deleteFacility(id) {
+  if(!confirm('Delete this facility?')) return;
+  apiPost('facility_delete',{id}).then(r=>{if(r.success){loadFacilitiesPage();loadMapData();loadStats();toast('Facility deleted.');}});
+}
+
+// ===================== INCIDENTS =====================
+function loadIncidentsPage() { loadIncidentReport(); }
+
+// ===================== INCIDENT REPORT (MONTHLY) =====================
+let _irIncidents = []; // store current filtered incidents for map view
+let _pendingMapView = false;
+
+function initIncidentReportFilters() {
+  const yr = qs('#irYear');
+  if (!yr || yr.options.length > 1) return;
+  const now = new Date();
+  for (let y = now.getFullYear(); y >= now.getFullYear() - 4; y--) {
+    const o = document.createElement('option');
+    o.value = y; o.textContent = y;
+    if (y === now.getFullYear()) o.selected = true;
+    yr.appendChild(o);
+  }
+  qs('#irMonth').value = now.getMonth() + 1;
+}
+
+function loadIncidentReport() {
+  initIncidentReportFilters();
+  const year   = qs('#irYear') ? qs('#irYear').value : '';
+  const month  = qs('#irMonth') ? qs('#irMonth').value : '';
+  const status = qs('#irStatus') ? qs('#irStatus').value : '';
+  const cat    = qs('#irCat') ? qs('#irCat').value : '';
+  let url = `incidents_monthly`;
+  const params = [];
+  if (year)   params.push(`year=${year}`);
+  if (month)  params.push(`month=${month}`);
+  if (status) params.push(`status=${status}`);
+  if (cat)    params.push(`category=${cat}`);
+  if (params.length) url += '&' + params.join('&');
+
+  const tbody = qs('#irTableBody');
+  const summary = qs('#irSummary');
+  if (tbody) tbody.innerHTML = `<tr><td colspan="8" class="loading-state">Loading...</td></tr>`;
+  if (summary) summary.innerHTML = '';
+
+  api(url).then(d => {
+    const incs = d.incidents || [];
+    const monthly = d.monthly || [];
+    _irIncidents = incs;
+
+    // If user clicked View on Map before data loaded, proceed now
+    if (_pendingMapView && incs.length) {
+      viewIncidentsOnMap();
+      return;
+    }
+
+    // Summary stats
+    const counts = { total: incs.length, open: 0, investigating: 0, resolved: 0, closed: 0 };
+    const types  = {};
+    incs.forEach(i => {
+      if (counts[i.status] !== undefined) counts[i.status]++;
+      types[i.category] = (types[i.category] || 0) + 1;
+    });
+    const topType = Object.entries(types).sort((a,b)=>b[1]-a[1])[0];
+    if (summary) summary.innerHTML = `
+      <div class="hstat"><div class="hstat-num">${counts.total}</div><div class="hstat-lbl">Total</div></div>
+      <div class="hstat" style="border-color:#f0cca0"><div class="hstat-num" style="color:#b06010">${counts.open}</div><div class="hstat-lbl">Open</div></div>
+      <div class="hstat" style="border-color:#c8d8f8"><div class="hstat-num" style="color:#2d5fa6">${counts.investigating}</div><div class="hstat-lbl">Investigating</div></div>
+      <div class="hstat" style="border-color:var(--green-line)"><div class="hstat-num" style="color:var(--green)">${counts.resolved}</div><div class="hstat-lbl">Resolved</div></div>
+      ${topType ? `<div class="hstat"><div class="hstat-num" style="font-size:.88rem">${incIcon(topType[0])}</div><div class="hstat-lbl">Top: ${topType[0]}</div></div>` : ''}
+    `;
+
+    // Bar chart (show when all months selected)
+    const chartWrap = qs('#irChartWrap');
+    if (chartWrap) {
+      if (!month && monthly.length > 0) {
+        chartWrap.style.display = '';
+        const max = Math.max(...monthly.map(m=>m.count), 1);
+        qs('#irChart').innerHTML = monthly.map(m => `
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;min-width:20px">
+            <div style="font-size:.60rem;color:var(--ink-mid);font-weight:600">${m.count}</div>
+            <div style="width:100%;background:var(--red);border-radius:4px 4px 0 0;height:${Math.round((m.count/max)*90)+4}px;min-height:4px"></div>
+          </div>`).join('');
+        qs('#irChartLabels').innerHTML = monthly.map(m => `
+          <div style="flex:1;min-width:20px;text-align:center;font-size:.54rem;color:var(--ink-lt);overflow:hidden;text-overflow:ellipsis">${m.label.split(' ')[0].substring(0,3)}</div>`).join('');
+      } else {
+        chartWrap.style.display = 'none';
+      }
+    }
+
+    // Table
+    if (!incs.length) {
+      if (tbody) tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:24px;color:var(--ink-lt);font-size:.84rem">No incidents found for this period.</td></tr>`;
+      return;
+    }
+    const stColor  = { open:'#b06010', investigating:'#2d5fa6', resolved:'#1f5c32', closed:'#666' };
+    if (tbody) tbody.innerHTML = incs.map(i => `
+      <tr>
+        <td style="white-space:nowrap">${i.date_fmt}</td>
+        <td>${incIcon(i.category)} ${incLabel(i.category)}</td>
+        <td style="max-width:200px;white-space:normal;font-size:.78rem">${i.description||'—'}</td>
+        <td>${i.reporter_name||i.reporter_fullname||'—'}</td>
+        <td>${i.reporter_contact||'—'}</td>
+        <td><span style="background:${stColor[i.status]||'#666'}20;color:${stColor[i.status]||'#666'};border:1px solid ${stColor[i.status]||'#666'}40;border-radius:20px;padding:2px 8px;font-size:.70rem;font-weight:700;white-space:nowrap">${i.status}</span></td>
+        <td>${i.lat&&i.lng?`<button class="btn-secondary" style="font-size:.70rem;padding:3px 8px;white-space:nowrap" onclick="flyToIncident(${i.lat},${i.lng},${i.id})">🗺 Map</button>`:`<span style="font-size:.70rem;color:var(--ink-lt)">No pin</span>`}</td>
+      </tr>`).join('');
+  });
+}
+
+function flyToIncident(lat, lng, id) {
+  showPage('map');
+  setTimeout(() => {
+    map.flyTo([+lat, +lng], 18);
+    // Open manage popup after fly
+    setTimeout(() => openIncManage(id), 800);
+  }, 200);
+}
+
+function viewIncidentsOnMap() {
+  // If data not loaded yet, load it then plot
+  if (!_irIncidents.length) {
+    toast('Loading incidents...');
+    _pendingMapView = true;
+    loadIncidentReport();
+    return;
+  }
+  _pendingMapView = false;
+  // Only approved incidents are plotted — unapproved/pending ones are handled
+  // in the Pending Reports tab, not on this view.
+  const approved = _irIncidents.filter(i => i.approved == 1);
+  const total = approved.length;
+  if (!total) { toast('No approved incidents found for this period.'); return; }
+
+  showPage('map');
+  // Hide report button — admin is viewing incident locations
+  const floatBtn = qs('#mapReportBtn');
+  const navPill  = qs('.mob-nav-report-wrap');
+  const csBtn1   = qs('#checkStatusBtn');
+  if (floatBtn) floatBtn.style.display = 'none';
+  if (navPill)  navPill.style.display  = 'none';
+  if (csBtn1)   csBtn1.style.display   = 'none';
+  setTimeout(() => {
+    markers.incidents.forEach(m => map.removeLayer(m));
+    markers.incidents = [];
+
+    const pinned   = [];
+    const unpinned = [];
+    const mob = isMobileScreen();
+    const vSize = mob ? 26 : 32;
+
+    approved.forEach(i => {
+      if (i.lat && i.lng) {
+        const html = `<div style="background:#e53935;color:#fff;border-radius:50%;width:${vSize}px;height:${vSize}px;display:flex;align-items:center;justify-content:center;font-size:${mob?13:16}px;box-shadow:0 2px 8px rgba(0,0,0,.4);border:2px solid #fff">${incIcon(i.category)}</div>`;
+        const ic = L.divIcon({ className:'', html, iconSize:[vSize,vSize], iconAnchor:[vSize/2,vSize/2] });
+        const m  = L.marker([+i.lat, +i.lng], {icon:ic}).addTo(map);
+        m.bindPopup(renderIncidentPopup(i, true), {maxWidth:270, minWidth:240});
+        markers.incidents.push(m);
+        pinned.push([+i.lat, +i.lng]);
+      } else {
+        unpinned.push(i);
+      }
+    });
+
+    if (unpinned.length) {
+      const uSize = mob ? 24 : 30;
+      unpinned.forEach((i, idx) => {
+        const lat = BRGY.lat + (idx * 0.00008);
+        const lng = BRGY.lng + (idx * 0.00008);
+        const html = `<div style="background:#888;color:#fff;border-radius:50%;width:${uSize}px;height:${uSize}px;display:flex;align-items:center;justify-content:center;font-size:${mob?11:14}px;box-shadow:0 2px 6px rgba(0,0,0,.3);border:2px dashed #fff;opacity:.85">${incIcon(i.category)}</div>`;
+        const ic = L.divIcon({ className:'', html, iconSize:[uSize,uSize], iconAnchor:[uSize/2,uSize/2] });
+        const m  = L.marker([lat, lng], {icon:ic}).addTo(map);
+        const card = renderIncidentPopup(i, true).replace(
+          '<div class="inc-pop-row">📅',
+          '<div class="inc-pop-row" style="color:#b06010">⚠ Exact location not pinned</div><div class="inc-pop-row">📅'
+        );
+        m.bindPopup(card, {maxWidth:270, minWidth:240});
+        markers.incidents.push(m);
+      });
+    }
+
+    const allCoords = [
+      ...pinned,
+      ...unpinned.map((_,idx) => [BRGY.lat + idx*0.00008, BRGY.lng + idx*0.00008])
+    ];
+    if (allCoords.length) {
+      map.fitBounds(L.latLngBounds(allCoords), { padding:[60,60], maxZoom:18 });
+    }
+
+    const msg = pinned.length === total
+      ? `Showing all ${total} incident${total>1?'s':''} on map`
+      : `Showing ${total} incident${total>1?'s':''} · ${pinned.length} pinned, ${unpinned.length} at barangay center`;
+    toast(msg);
+  }, 250);
+}
+
+let incidentModalMode = 'report'; // 'report' or 'manage'
+let managingIncidentId = null;
+
+function openIncidentModal() {
+  const u = currentUser();
+  // Officials and admin cannot submit incident reports — they manage them
+  if (isStaff(u)) {
+    toast('Officials manage incidents via the Admin Dashboard → Pending Reports.');
+    showPage('admin');
+    return;
+  }
+  incidentModalMode='report'; managingIncidentId=null;
+  qs('#incModalTitle').textContent='🚨 Report Incident';
+  qs('#iTitle').value='';qs('#iCat').value='fire';qs('#iSev').value='medium';qs('#iDesc').value='';
+  qs('#iAddr').value='';qs('#iName').value='';qs('#iContact').value='';qs('#iLat').value='';qs('#iLng').value='';qs('#iId').value='';
+  qs('#iErr').style.display='none';
+  resetPinUI('incPinInfo','incPinEmpty');
+  // Reset use-location button
+  const locBtn = qs('#useLocationBtn');
+  if (locBtn) { locBtn.disabled=false; locBtn.textContent='Use My Current Location'; locBtn.style.background=''; locBtn.style.color=''; locBtn.innerHTML=`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:15px;height:15px"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="9" stroke-dasharray="2 2"/></svg> Use My Current Location`; }
+  openModal('incidentModal');
+  setTimeout(()=>initPinMap('incPinMap',(la,ln)=>{qs('#iLat').value=la;qs('#iLng').value=ln;qs('#incPinCoord').textContent=`${la}, ${ln}`;qs('#incPinInfo').style.display='flex';qs('#incPinEmpty').style.display='none';}),150);
+  setTimeout(initOrResetRecaptcha, 200);
+}
+
+// ===================== reCAPTCHA =====================
+let _recaptchaSiteKey = null;
+let _recaptchaWidgetId = null;
+
+function initOrResetRecaptcha() {
+  if (_recaptchaWidgetId !== null && window.grecaptcha) {
+    grecaptcha.reset(_recaptchaWidgetId);
+    return;
+  }
+  if (_recaptchaSiteKey === null) {
+    api('app_config').then(cfg => {
+      _recaptchaSiteKey = cfg.recaptcha_site_key || '';
+      renderRecaptchaWhenReady();
+    });
+  } else {
+    renderRecaptchaWhenReady();
+  }
+}
+
+function renderRecaptchaWhenReady() {
+  if (!_recaptchaSiteKey) return; // no key configured — CAPTCHA disabled
+  const container = qs('#recaptchaContainer');
+  if (!container) return;
+  if (!window.grecaptcha || !grecaptcha.render) {
+    setTimeout(renderRecaptchaWhenReady, 250); // wait for Google's script to finish loading
+    return;
+  }
+  if (_recaptchaWidgetId !== null) return; // already rendered
+  _recaptchaWidgetId = grecaptcha.render(container, { sitekey: _recaptchaSiteKey });
+}
+
+function getRecaptchaResponse() {
+  if (!_recaptchaSiteKey) return ''; // CAPTCHA disabled — nothing to check
+  if (_recaptchaWidgetId === null || !window.grecaptcha) return '';
+  return grecaptcha.getResponse(_recaptchaWidgetId);
+}
+
+
+function useMyLocation() {
+  const btn = qs('#useLocationBtn');
+  if (!navigator.geolocation) {
+    toast('⚠ Your browser does not support GPS location.');
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Getting location...'; }
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      const lat = pos.coords.latitude.toFixed(6);
+      const lng = pos.coords.longitude.toFixed(6);
+      // Place pin on the incident map
+      const onPlace = (la, ln) => {
+        qs('#iLat').value = la;
+        qs('#iLng').value = ln;
+        qs('#incPinCoord').textContent = `${la}, ${ln}`;
+        qs('#incPinInfo').style.display = 'flex';
+        qs('#incPinEmpty').style.display = 'none';
+      };
+      placePinMap('incPinMap', lat, lng, onPlace);
+      // Pan the incident pin map to the location
+      if (pinMaps['incPinMap']) {
+        pinMaps['incPinMap'].setView([+lat, +lng], 18);
+      }
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:15px;height:15px"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="9" stroke-dasharray="2 2"/></svg> Location Set ✓`;
+        btn.style.background = 'var(--green)';
+        btn.style.color = '#fff';
+      }
+      toast('📍 Location pinned from your GPS!');
+    },
+    err => {
+      if (btn) { btn.disabled = false; btn.textContent = 'Use My Current Location'; }
+      const msgs = {
+        1: 'Location access denied. Please allow location in your browser settings.',
+        2: 'Unable to determine your location. Try pinning manually.',
+        3: 'Location request timed out. Try pinning manually.'
+      };
+      toast('⚠ ' + (msgs[err.code] || 'Could not get location.'));
+    },
+    { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+  );
+}
+
+function clearIncPin(){clearPinMap('incPinMap',()=>{resetPinUI('incPinInfo','incPinEmpty');qs('#iLat').value='';qs('#iLng').value=''});}
+
+function submitIncident() {
+  const cat=qs('#iCat').value, desc=qs('#iDesc').value.trim();
+  const name=qs('#iName').value.trim(), contact=qs('#iContact').value.trim();
+  const lat=qs('#iLat').value, lng=qs('#iLng').value;
+  const e=qs('#iErr');
+
+  if(!lat||!lng){e.textContent='Please pin the incident location on the map.';e.style.display='block';return;}
+  if(!desc){e.textContent='Description is required.';e.style.display='block';return;}
+  if(!name){e.textContent='Your name is required.';e.style.display='block';return;}
+  if(!contact){e.textContent='Your contact number is required.';e.style.display='block';return;}
+
+  const recaptchaResponse = getRecaptchaResponse();
+  if (_recaptchaSiteKey && !recaptchaResponse) {
+    e.textContent = 'Please complete the "I\'m not a robot" check before submitting.';
+    e.style.display = 'block';
+    return;
+  }
+  e.style.display='none';
+
+  const title=qs('#iTitle').value.trim()||incLabel(cat);
+  const photoFile = qs('#iPhoto') && qs('#iPhoto').files[0];
+
+  const doSubmit = (photoData) => {
+    const website = qs('#iWebsite') ? qs('#iWebsite').value : ''; // honeypot
+    const data={title,category:cat,description:desc,severity:'medium',address:qs('#iAddr').value.trim(),reporter_name:name,reporter_contact:contact,lat,lng,photo:photoData||null,website,g_recaptcha_response:recaptchaResponse};
+    apiPost('incident_report',data).then(r=>{
+      if (window.grecaptcha && _recaptchaWidgetId !== null) grecaptcha.reset(_recaptchaWidgetId);
+      if(r.error){e.textContent=r.error;e.style.display='block';return;}
+      closeModal('incidentModal');loadMapData();loadStats();loadSidebarIncidents();
+      showReportSuccessModal(r.reference_code);
+    });
+  };
+
+  if(photoFile){
+    const reader=new FileReader();
+    reader.onload=ev=>doSubmit(ev.target.result);
+    reader.readAsDataURL(photoFile);
+  } else {
+    doSubmit(null);
+  }
+}
+
+function showReportSuccessModal(code) {
+  qs('#reportRefCode').textContent = code || '—';
+  openModal('reportSuccessModal');
+}
+
+function copyRefCode() {
+  const code = qs('#reportRefCode').textContent;
+  navigator.clipboard.writeText(code).then(() => {
+    toast('Reference code copied!');
+  }).catch(() => {
+    toast('Could not copy — please write it down manually.');
+  });
+}
+
+function checkReportStatus() {
+  const code = qs('#csCode').value.trim().toUpperCase();
+  const err = qs('#csErr');
+  const result = qs('#csResult');
+  err.style.display = 'none';
+  result.style.display = 'none';
+  if (!code) { err.textContent = 'Please enter your reference code.'; err.style.display = 'block'; return; }
+
+  api(`check_report_status&code=${encodeURIComponent(code)}`).then(r => {
+    if (r.error) { err.textContent = r.error; err.style.display = 'block'; return; }
+    const rep = r.report;
+    const sm = incStatusMeta(rep.status);
+    const isPending = rep.approved != 1;
+    result.innerHTML = `
+      <div class="inc-pop" style="border:1px solid var(--border);border-radius:var(--r-lg);padding:14px">
+        <div class="inc-pop-hd">
+          <div class="inc-pop-icon">${incIcon(rep.category)}</div>
+          <div>
+            <div class="inc-pop-title">${incLabel(rep.category)}</div>
+            <div class="inc-pop-sub">Filed ${fmtIncidentDate(rep.created_at)}</div>
+          </div>
+        </div>
+        ${isPending
+          ? `<div class="inc-pop-row" style="color:#b06010">⏳ Awaiting review by a Barangay Official</div>`
+          : `<div class="inc-pop-status"><span class="inc-pop-pill" style="color:${sm.color};border-color:${sm.color}55;background:${sm.color}14">● ${sm.label}</span></div>`}
+        ${rep.resolution_notes ? `<div class="inc-pop-quote">“${escH(rep.resolution_notes)}”</div>` : ''}
+      </div>`;
+    result.style.display = 'block';
+  });
+}
+
+
+function openIncManage(id) {
+  const u=currentUser();
+  qs('#incManageBd').innerHTML='<div class="loading-state">Loading...</div>';
+  openModal('incManageModal');
+  api(`incidents`).then(incs=>{
+    const i=incs.find(x=>x.id==id);
+    if(!i){qs('#incManageBd').innerHTML='<div class="empty-state">Not found.</div>';return;}
+    const canManage=isStaff(u);
+    const canDelete=isSuperAdminUser(u);
+    const sm = incStatusMeta(i.status);
+    const reporter = i.reporter_name || i.reporter_fullname || 'Anonymous';
+    const photoHtml = i.photo
+      ? `<div style="margin-bottom:14px">
+           <div style="font-size:.76rem;font-weight:700;color:var(--ink-mid);text-transform:uppercase;letter-spacing:.3px;margin-bottom:6px">📷 Photo Proof</div>
+           <img src="${i.photo}" style="width:100%;max-height:260px;object-fit:cover;border-radius:var(--r);border:1px solid var(--border);cursor:pointer" onclick="openPhotoLightbox('${i.photo}')" title="Click to view full size">
+         </div>`
+      : `<div style="font-size:.78rem;color:var(--ink-lt);margin-bottom:14px;padding:10px;background:var(--bg);border-radius:var(--r);border:1px dashed var(--border)">📷 No photo proof attached</div>`;
+    qs('#incManageBd').innerHTML=`
+      ${photoHtml}
+      <div class="inc-pop" style="margin-bottom:14px">
+        <div class="inc-pop-hd">
+          <div class="inc-pop-icon">${incIcon(i.category)}</div>
+          <div>
+            <div class="inc-pop-title">${incLabel(i.category)}</div>
+            <div class="inc-pop-sub">${i.address ? escH(i.address) : 'Brgy. Cabugao'}</div>
+          </div>
+        </div>
+        <div class="inc-pop-row">📅 ${fmtIncidentDate(i.created_at)}</div>
+        <div class="inc-pop-row">👤 Reported by <b>${escH(reporter)}</b></div>
+        ${i.reporter_contact ? `<div class="inc-pop-row">📞 ${escH(i.reporter_contact)}</div>` : ''}
+        ${i.reference_code ? `<div class="inc-pop-row">🔖 Ref: <b style="font-family:monospace;letter-spacing:1px">${escH(i.reference_code)}</b></div>` : ''}
+        ${i.description ? `<div class="inc-pop-quote">“${escH(i.description)}”</div>` : ''}
+        <div class="inc-pop-status"><span class="inc-pop-pill" style="color:${sm.color};border-color:${sm.color}55;background:${sm.color}14">● ${sm.label}</span></div>
+      </div>
+      ${canManage?`<hr>
+      <div class="form-group"><label>Status</label>
+        <select id="imStatus" class="form-control">
+          <option value="investigating" ${i.status==='investigating'?'selected':''}>Investigating</option>
+          <option value="resolved" ${i.status==='resolved'?'selected':''}>Resolved</option>
+        </select>
+      </div>
+      <div class="form-group"><label>Resolution Notes</label><textarea id="imNotes" class="form-control" rows="2">${i.resolution_notes||''}</textarea></div>
+      <div style="display:flex;gap:8px">
+        <button class="btn-primary" style="flex:1" onclick="updateIncident(${i.id})">Update Incident</button>
+        ${canDelete?`<button class="btn-del" onclick="deleteIncident(${i.id})">🗑 Delete</button>`:''}
+      </div>
+      `:`<div class="hint">Log in as Admin to manage this incident.</div>`}`;
+  });
+}
+
+function updateIncident(id) {
+  apiPost('incident_update',{id,status:qs('#imStatus').value,resolution_notes:qs('#imNotes').value}).then(r=>{
+    if(r.success){closeModal('incManageModal');loadMapData();loadIncidentsPage();loadSidebarIncidents();loadStats();toast('✅ Incident updated.');}
+  });
+}
+
+function deleteIncident(id) {
+  if(!confirm('Delete this incident report? This cannot be undone.')) return;
+  apiPost('incident_delete',{id}).then(r=>{if(r.success){closeModal('incManageModal');loadMapData();loadIncidentsPage();loadStats();toast('Incident deleted.');}});
+}
+
+// ===================== SEARCH =====================
+let searchTimer;
+function doSearch(q) {
+  clearTimeout(searchTimer);
+  if(q.length<2){qs('#searchResults').classList.remove('show');return;}
+  searchTimer=setTimeout(()=>{
+    api(`search&q=${encodeURIComponent(q)}`).then(d=>{
+      const sr=qs('#searchResults');
+      if(!d.results||!d.results.length){sr.innerHTML='<div style="padding:12px;font-size:.82rem;color:var(--text-lt);text-align:center">No results found.</div>';sr.classList.add('show');return;}
+      sr.innerHTML=d.results.map(r=>`
+        <div class="search-item" onclick="handleSearchResult(${JSON.stringify(r).replace(/"/g,'&quot;')})">
+          <span>${searchTypeIcon(r.type)}</span>
+          <div><div class="search-item-label">${r.label.trim()}</div><div class="search-item-sub">${r.sublabel||r.type}</div></div>
+        </div>`).join('');
+      sr.classList.add('show');
+    });
+  },300);
+}
+
+function handleSearchResult(r) {
+  qs('#searchResults').classList.remove('show');
+  qs('#globalSearch').value='';
+  showPage('map');
+  if(r.lat&&r.lng) { setTimeout(()=>map.flyTo([+r.lat,+r.lng],18),100); }
+  const u=currentUser();
+  if(isStaff(u)) {
+    if(r.type==='member'||r.type==='house') { setTimeout(()=>openHouseModal(r.house_id||r.id),500); }
+  }
+}
+
+function searchTypeIcon(t){return{house:'🏠',member:'👤',facility:'🏛',street:'🗺️',purok:'🟣'}[t]||'📌';}
+document.addEventListener('click',e=>{if(!e.target.closest('.header-search')) qs('#searchResults').classList.remove('show');});
+
+
+// ===================== ADMIN: ADD HOUSE =====================
+let houseAdminPinMap = null;
+let houseAdminPinMarker = null;
+
+function initHouseAdminPinMap() {
+  if (houseAdminPinMap) { houseAdminPinMap.invalidateSize(); return; }
+  const bounds = L.latLngBounds(L.latLng(BRGY.swLat, BRGY.swLng), L.latLng(BRGY.neLat, BRGY.neLng));
+  houseAdminPinMap = L.map('houseAdminPinMap', {
+    zoomControl: true, minZoom: 14, maxZoom: 19,
+    maxBounds: bounds, maxBoundsViscosity: 1.0
+  }).setView([BRGY.lat, BRGY.lng], BRGY.zoom);
+
+  if (curLayer === 'satellite') {
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {maxZoom:19}).addTo(houseAdminPinMap);
+  } else {
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19}).addTo(houseAdminPinMap);
+  }
+
+  // Show boundary
+  // Boundary polygon removed
+
+  // Show existing house markers for reference
+  api('map_data').then(d => {
+    (d.houses||[]).forEach(h => {
+      if (!h.lat||!h.lng) return;
+      L.circleMarker([+h.lat,+h.lng], { radius:5, color:'#f5a623', fillColor:'#f5a623', fillOpacity:0.7, weight:1 })
+       .bindTooltip(`${h.house_name||h.house_number||'House'}`, {direction:'top'})
+       .addTo(houseAdminPinMap);
+    });
+  });
+
+  houseAdminPinMap.on('click', function(e) {
+    placeHouseAdminPin(e.latlng.lat.toFixed(6), e.latlng.lng.toFixed(6));
+  });
+
+  setTimeout(() => houseAdminPinMap.invalidateSize(), 200);
+}
+
+function placeHouseAdminPin(lat, lng) {
+  const ic = L.divIcon({
+    className: '',
+    html: `<div style="text-align:center">
+             <div style="font-size:26px;filter:drop-shadow(0 2px 4px rgba(0,0,0,.5))">📍</div>
+             <div style="background:#f5a623;color:#333;border-radius:4px;padding:1px 5px;font-size:9px;font-weight:800;margin-top:-4px;white-space:nowrap">New House</div>
+           </div>`,
+    iconSize: [60, 42], iconAnchor: [18, 38]
+  });
+  if (houseAdminPinMarker) houseAdminPinMap.removeLayer(houseAdminPinMarker);
+  houseAdminPinMarker = L.marker([+lat, +lng], { icon: ic, draggable: true }).addTo(houseAdminPinMap);
+  houseAdminPinMarker.on('dragend', function() {
+    const p = houseAdminPinMarker.getLatLng();
+    placeHouseAdminPin(p.lat.toFixed(6), p.lng.toFixed(6));
+  });
+  qs('#ahAdminLat').value = lat;
+  qs('#ahAdminLng').value = lng;
+  qs('#houseAdminPinCoord').textContent = `${lat}, ${lng}`;
+  qs('#houseAdminPinInfo').style.display = 'flex';
+  qs('#houseAdminPinEmpty').style.display = 'none';
+}
+
+function clearHouseAdminPin() {
+  if (houseAdminPinMarker && houseAdminPinMap) { houseAdminPinMap.removeLayer(houseAdminPinMarker); houseAdminPinMarker = null; }
+  qs('#ahAdminLat').value = '';
+  qs('#ahAdminLng').value = '';
+  qs('#houseAdminPinInfo').style.display = 'none';
+  qs('#houseAdminPinEmpty').style.display = 'block';
+}
+
+function loadAdminHouseStreets() {
+  loadAllStreets('ahAdminStreet');
+  qs('#ahAdminPurok').innerHTML = '<option value="">Select a street first...</option>';
+}
+
+function submitAdminHouse() {
+  const sid  = qs('#ahAdminStreet').value;
+  const num  = qs('#ahAdminNum').value.trim();
+  const lat  = qs('#ahAdminLat').value;
+  const lng  = qs('#ahAdminLng').value;
+  const e    = qs('#ahAdminErr');
+
+  const pid  = qs('#ahAdminPurok').value;
+  if (!sid)  { e.textContent = 'Please select a street.'; e.style.display='block'; return; }
+  if (!pid)  { e.textContent = 'Please select a purok.'; e.style.display='block'; return; }
+  if (!num)  { e.textContent = 'House number is required.'; e.style.display='block'; return; }
+  if (!lat || !lng) { e.textContent = 'Please pin the house location on the map.'; e.style.display='block'; return; }
+  e.style.display = 'none';
+
+  apiPost('house_add', { purok_id: pid, house_number: num, house_name: '', lat, lng }).then(r => {
+    if (r.error) { e.textContent = r.error; e.style.display='block'; return; }
+    // Clear form
+    qs('#ahAdminStreet').value = '';
+    qs('#ahAdminPurok').innerHTML = '<option value="">Select a street first...</option>';
+    qs('#ahAdminNum').value = '';
+    qs('#ahAdminName').value = '';
+    clearHouseAdminPin();
+    loadMapData(); loadStats(); loadStreetSidebar();
+    map.flyTo([+lat, +lng], 18);
+    toast('✅ House added! Click its marker on the map to add members.');
+    // Reload existing pins on admin map to show new house
+    initHouseAdminPinMap();
+    houseAdminPinMap = null; // force reinit to refresh existing markers
+    setTimeout(initHouseAdminPinMap, 100);
+  });
+}
+
+// ===================== ADMIN =====================
+function loadAdminPage() {
+  const u = currentUser();
+  if (!u) return;
+  const isSuper = isSuperAdminUser(u);
+
+  const welcome = qs('#adminWelcome');
+  if (!isSuper) {
+    if (welcome) welcome.textContent = `Welcome, ${u.full_name} — Barangay Official (Admin)`;
+    // Regular Admins land on Pending Reports tab — their primary day-to-day task
+    qsa('.adtab').forEach(b => b.classList.remove('active'));
+    qsa('.admin-panel').forEach(p => p.classList.remove('active'));
+    qsa('.adtab').forEach(b => { if (b.textContent.includes('Pending')) b.classList.add('active'); });
+    const pp = qs('#ap-pending');
+    if (pp) pp.classList.add('active');
+  } else {
+    if (welcome) welcome.textContent = `Welcome, ${u.full_name} — Barangay Captain (Super Admin)`;
+    // Super Admin lands on Bulk Import tab (default)
+    qsa('.adtab').forEach((b,i) => b.classList.toggle('active', i===0));
+    qsa('.admin-panel').forEach((p,i) => p.classList.toggle('active', i===0));
+  }
+
+  loadPendingIncidents(); // both roles always load pending count
+
+  if (isStaff(u)) {
+    loadAdminStreets();
+  }
+  if (isSuper) {
+    loadUsers();
+  }
+}
+
+function adminTab(tab) {
+  qsa('.adtab').forEach(b=>b.classList.remove('active'));
+  qsa('.admin-panel').forEach(p=>p.classList.remove('active'));
+  if (event && event.target) event.target.classList.add('active');
+  const panel = qs(`#ap-${tab}`);
+  if (panel) panel.classList.add('active');
+  if(tab==='pending')    loadPendingIncidents();
+  if(tab==='facilities') loadFacilitiesPage();
+  if(tab==='houses')     { loadAdminHouseStreets(); setTimeout(initHouseAdminPinMap, 150); }
+  if(tab==='streets')    { loadAdminStreets(); setTimeout(initStreetPinMap, 150); }
+  if(tab==='puroks')     { loadAdminPuroks(); setTimeout(initPurokPinMap, 150); }
+  if(tab==='users')      loadUsers();
+  if(tab==='activitylog') loadActivityLog();
+}
+
+// ===================== INCIDENT REPORT (MONTHLY) =====================
+function initIncidentReportFilters() {
+  const yr = qs('#irYear');
+  if (!yr || yr.options.length > 1) return;
+  const now = new Date();
+  for (let y = now.getFullYear(); y >= now.getFullYear() - 4; y--) {
+    const o = document.createElement('option');
+    o.value = y; o.textContent = y;
+    if (y === now.getFullYear()) o.selected = true;
+    yr.appendChild(o);
+  }
+  // Default month to current
+  qs('#irMonth').value = now.getMonth() + 1;
+}
+
+// ===================== ADMIN INCIDENT NOTIFICATIONS =====================
+let _knownPendingIds = new Set();
+let _pollTimer = null;
+let _notifFirstRun = true;
+let _alertsMuted = (localStorage.getItem('inspire_alerts_muted') === '1');
+let _lastReminderAt = 0;
+
+function toggleAlertMute() {
+  _alertsMuted = !_alertsMuted;
+  localStorage.setItem('inspire_alerts_muted', _alertsMuted ? '1' : '0');
+  syncAlertMuteBtn();
+  if (!_alertsMuted) playAlertSound(); // quick confirmation beep when unmuting
+  toast(_alertsMuted ? '🔇 Incident alert sounds muted' : '🔔 Incident alert sounds on');
+}
+
+function syncAlertMuteBtn() {
+  const btn = qs('#alertMuteBtn');
+  if (!btn) return;
+  btn.textContent = _alertsMuted ? '🔇' : '🔔';
+  btn.classList.toggle('muted', _alertsMuted);
+  btn.title = _alertsMuted ? 'Unmute incident alert sounds' : 'Mute incident alert sounds';
+}
+
+// Urgent two-pulse alert tone — sharper than a normal UI chime so a new
+// emergency report is unmistakable, used for both new-report alerts and
+// the periodic "still pending" reminder.
+function playAlertSound(urgent) {
+  if (_alertsMuted) return;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new Ctx();
+    const now = ctx.currentTime;
+    const pulses = urgent ? [780, 780, 780] : [780, 780];
+    pulses.forEach((freq, i) => {
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.value = freq;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      const start = now + i * 0.22;
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(0.34, start + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.001, start + 0.18);
+      osc.start(start);
+      osc.stop(start + 0.2);
+    });
+  } catch (e) { /* audio not supported, fail silently */ }
+}
+// Backward-compatible alias
+function playNotifSound() { playAlertSound(true); }
+
+function showIncidentNotif(incs) {
+  playAlertSound(true);
+  // Animate the pending badge
+  const badge = qs('#pendingBadge');
+  if (badge) { badge.classList.add('badge-pulse'); setTimeout(()=>badge.classList.remove('badge-pulse'), 1600); }
+  // Animate the nav Incidents tab badge dot if present
+  const navDot = qs('#navIncidentsDot');
+  if (navDot) navDot.style.display = 'block';
+
+  incs.forEach(i => {
+    showNotifToast(`🚨 New ${incLabel(i.category)} report from ${i.reporter_name || 'Anonymous'}`, i.id);
+  });
+
+  // Flash the browser tab title briefly
+  const originalTitle = document.title;
+  let flashes = 0;
+  const flashTimer = setInterval(() => {
+    document.title = flashes % 2 === 0 ? `🔴 New Incident Report!` : originalTitle;
+    flashes++;
+    if (flashes >= 6) { clearInterval(flashTimer); document.title = originalTitle; }
+  }, 700);
+}
+
+function showNotifToast(msg, incidentId) {
+  const el = document.createElement('div');
+  el.className = 'incident-notif-toast';
+  el.innerHTML = `
+    <div class="incident-notif-icon">🔔</div>
+    <div class="incident-notif-body">
+      <div class="incident-notif-msg">${msg}</div>
+      <div class="incident-notif-action">Tap to review</div>
+    </div>
+    <button class="incident-notif-close" onclick="event.stopPropagation();this.closest('.incident-notif-toast').remove()">✕</button>
+  `;
+  el.onclick = () => { showPage('admin'); adminTabSilent('pending'); el.remove(); };
+  let wrap = qs('#incidentNotifWrap');
+  if (!wrap) {
+    wrap = document.createElement('div');
+    wrap.id = 'incidentNotifWrap';
+    document.body.appendChild(wrap);
+  }
+  wrap.appendChild(el);
+  setTimeout(() => { el.classList.add('show'); }, 10);
+  setTimeout(() => { el.classList.remove('show'); setTimeout(()=>el.remove(), 300); }, 8000);
+}
+
+function adminTabSilent(tab) {
+  qsa('.adtab').forEach(b=>b.classList.remove('active'));
+  qsa('.admin-panel').forEach(p=>p.classList.remove('active'));
+  qsa('.adtab').forEach(b => { if (b.textContent.includes('Pending')) b.classList.add('active'); });
+  const panel = qs(`#ap-${tab}`);
+  if (panel) panel.classList.add('active');
+  if (tab === 'pending') loadPendingIncidents();
+}
+
+function pollForNewIncidents() {
+  if (!isStaff(_user)) return;
+  api('incidents_pending').then(incs => {
+    const currentIds = new Set(incs.map(i => i.id));
+    if (_notifFirstRun) {
+      // First run after login — just record state, don't notify for existing backlog
+      _knownPendingIds = currentIds;
+      _notifFirstRun = false;
+      return;
+    }
+    const newOnes = incs.filter(i => !_knownPendingIds.has(i.id));
+    if (newOnes.length) {
+      showIncidentNotif(newOnes);
+      // Drop the new pin(s) onto the map right away — works whether the admin
+      // is currently looking at the Map page or another tab, since markers
+      // are added to the Leaflet instance regardless of which page is visible.
+      loadMapData();
+      _lastReminderAt = Date.now(); // the alert we just played counts as the reminder too
+    } else if (incs.length > 0 && Date.now() - _lastReminderAt > 60000) {
+      // Gentle reminder ping every 60s for as long as reports remain unaddressed —
+      // so a report can't be missed just because the admin stepped away briefly.
+      playAlertSound(false);
+      _lastReminderAt = Date.now();
+    }
+    _knownPendingIds = currentIds;
+
+    // Keep badge + list fresh if pending tab is currently open
+    const badge = qs('#pendingBadge');
+    if (badge) { badge.textContent = incs.length; badge.style.display = incs.length ? 'inline-block' : 'none'; }
+    const pendingPanelActive = qs('#ap-pending') && qs('#ap-pending').classList.contains('active');
+    if (pendingPanelActive) loadPendingIncidents();
+  }).catch(()=>{});
+}
+
+function startIncidentPolling() {
+  stopIncidentPolling();
+  _notifFirstRun = true;
+  pollForNewIncidents(); // establish baseline immediately
+  _pollTimer = setInterval(pollForNewIncidents, 8000); // check every 8s for near-instant updates
+}
+
+function stopIncidentPolling() {
+  if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
+  _knownPendingIds = new Set();
+}
+
+// ===================== PENDING INCIDENTS =====================
+function loadPendingIncidents() {
+  api('incidents_pending').then(incs => {
+    // Update badge count
+    const badge = qs('#pendingBadge');
+    if (badge) {
+      badge.textContent = incs.length;
+      badge.style.display = incs.length ? 'inline-block' : 'none';
+    }
+    const container = qs('#pendingList');
+    if (!container) return;
+
+    if (!incs.length) {
+      container.innerHTML = '<div class="empty-state" style="padding:40px">✅ No pending incident reports. All caught up!</div>';
+      return;
+    }
+
+    container.innerHTML = incs.map(i => `
+      <div class="pending-card" id="pc-${i.id}">
+        <div class="pending-card-hd">
+          <div style="flex:1">
+            <div class="pending-title">${incIcon(i.category)} ${i.title}</div>
+            <div class="pending-meta">
+              <span class="badge cat-${i.category}">${incLabel(i.category)}</span>
+              <span class="badge sev-${i.severity}">${i.severity}</span>
+              <span style="color:var(--text-lt)">· ${new Date(i.created_at).toLocaleString('en-PH')}</span>
+            </div>
+            <div class="pending-meta" style="margin-top:6px;font-size:.82rem;color:var(--text)">${i.description}</div>
+            ${i.address ? `<div class="pending-meta">📍 ${i.address}</div>` : ''}
+            <div class="pending-meta">
+              👤 <strong>${i.reporter_name || i.reporter_fullname || 'Anonymous'}</strong>
+              ${i.reporter_contact ? ' · 📞 ' + i.reporter_contact : ''}
+            </div>
+            ${i.reference_code ? `<div class="pending-meta">🔖 Ref: <strong style="font-family:monospace;letter-spacing:1px">${i.reference_code}</strong></div>` : ''}
+            ${i.photo
+              ? `<div style="margin-top:10px">
+                   <div style="font-size:.72rem;font-weight:700;color:var(--ink-mid);text-transform:uppercase;letter-spacing:.3px;margin-bottom:5px">📷 Photo Proof</div>
+                   <img src="${i.photo}" style="width:100%;max-height:200px;object-fit:cover;border-radius:var(--r);border:1px solid var(--border);cursor:pointer" onclick="openPhotoLightbox('${i.photo}')" title="Click to view full size">
+                 </div>`
+              : `<div style="font-size:.75rem;color:var(--ink-lt);margin-top:8px">📷 No photo attached</div>`}
+          </div>
+        </div>
+        <div class="pending-actions">
+          <button class="btn-approve" onclick="approveIncident(${i.id}, this)">✅ Approve & Show on Map</button>
+          <button class="btn-reject" onclick="rejectIncident(${i.id}, this)">❌ Reject</button>
+          ${i.lat && i.lng
+            ? `<button class="btn-secondary" style="font-size:.76rem;padding:4px 12px" onclick="previewOnMap(${i.id})">🗺 Preview on Map</button>`
+            : '<span class="hint" style="font-size:.75rem">⚠ No GPS location pinned</span>'}
+        </div>
+      </div>`).join('');
+  });
+}
+
+function approveIncident(id, btn) {
+  if (!confirm('Approve this incident? It will immediately appear as a pin on the map for all users.')) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Approving...'; }
+  apiPost('incident_approve', {id}).then(r => {
+    if (r.success) {
+      loadPendingIncidents();  // refresh pending list + badge
+      loadMapData();           // approved pin now appears on map
+      loadStats();
+      loadSidebarIncidents();
+      loadIncidentsPage();
+      toast('✅ Approved! The incident pin is now visible on the public map.');
+    } else {
+      if (btn) { btn.disabled = false; btn.textContent = '✅ Approve & Show on Map'; }
+      toast('Error: ' + (r.error || 'Could not approve.'));
+    }
+  });
+}
+
+function rejectIncident(id, btn) {
+  const reason = prompt('Reason for rejection (optional):');
+  if (reason === null) return; // cancelled
+  if (btn) { btn.disabled = true; btn.textContent = 'Rejecting...'; }
+  apiPost('incident_reject', {id, reason: reason || ''}).then(r => {
+    if (r.success) {
+      loadPendingIncidents();
+      loadStats();
+      toast('Report rejected and removed.');
+    } else {
+      if (btn) { btn.disabled = false; btn.textContent = '❌ Reject'; }
+      toast('Error: ' + (r.error || 'Could not reject.'));
+    }
+  });
+}
+
+function previewOnMap(id) {
+  showPage('map');
+  // Hide report buttons during preview
+  const floatBtn = qs('#mapReportBtn');
+  const navPill  = qs('.mob-nav-report-wrap');
+  const csBtn2   = qs('#checkStatusBtn');
+  if (floatBtn) floatBtn.style.display = 'none';
+  if (navPill)  navPill.style.display  = 'none';
+  if (csBtn2)   csBtn2.style.display   = 'none';
+
+  api('incidents').then(incs => {
+    const i = incs.find(x => x.id == id);
+    if (!i || !i.lat || !i.lng) { toast('No location pinned for this report.'); return; }
+
+    setTimeout(() => {
+      if (!map) return;
+      // Remove all existing incident markers
+      markers.incidents.forEach(m => map.removeLayer(m));
+      markers.incidents = [];
+
+      // Place only this pending incident as a distinct pulsing preview marker
+      const mob = isMobileScreen();
+      const pSize = mob ? 30 : 36;
+      const html = `<div style="background:#e67e22;color:#fff;border-radius:50%;width:${pSize}px;height:${pSize}px;display:flex;align-items:center;justify-content:center;font-size:${mob?15:18}px;box-shadow:0 2px 10px rgba(0,0,0,.4);border:3px solid #fff;animation:pulse 1.5s infinite">${incIcon(i.category)}</div>`;
+      const ic = L.divIcon({ className:'', html, iconSize:[pSize,pSize], iconAnchor:[pSize/2,pSize/2] });
+      const m  = L.marker([+i.lat, +i.lng], {icon:ic}).addTo(map);
+      m.bindPopup(renderIncidentPopup(i, true), {maxWidth:270, minWidth:240}).openPopup();
+      markers.incidents.push(m);
+
+      map.flyTo([+i.lat, +i.lng], mob ? 17 : 18);
+      toast('Previewing pending incident location. Other markers hidden.');
+    }, 200);
+  });
+}
+
+function loadAdminStreets() {
+  const u = currentUser();
+  const canDelete = isSuperAdminUser(u);
+  api('streets').then(streets=>{
+    if (!streets.length) {
+      qs('#adminStreets').innerHTML='<div class="hint">No streets yet. Add one above.</div>';
+      return;
+    }
+    qs('#adminStreets').innerHTML = streets.map(s=>`
+      <div class="admin-street-item">
+        <span>
+          <strong>${s.name}</strong>
+          <span class="badge" style="background:var(--green-pale);color:var(--green);margin-left:6px">🏠 ${s.house_count} &nbsp;👥 ${s.population}</span>
+        </span>
+        ${canDelete ? `<button class="btn-del" data-id="${s.id}" data-name="${escH(s.name)}" onclick="deleteStreet(this)">🗑 Delete</button>` : ''}
+      </div>`).join('');
+  });
+}
+
+function deleteStreet(btn) {
+  const id   = btn.dataset.id;
+  const name = btn.dataset.name;
+  if (!confirm(`Delete "${name}" and ALL its houses & members? This cannot be undone.`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Deleting...';
+  apiPost('street_delete', {id: parseInt(id)}).then(r => {
+    if (r.success) {
+      loadAdminStreets();
+      loadStreetSidebar();
+      loadMapData();
+      loadStats();
+      toast('Street deleted.');
+    } else {
+      btn.disabled = false;
+      btn.textContent = '🗑 Delete';
+      toast('Error: ' + (r.error || 'Could not delete street.'));
+    }
+  });
+}
+
+// Street pin map state
+let streetPinMap = null;
+let streetPinMarker = null;
+
+function initStreetPinMap() {
+  if (streetPinMap) { streetPinMap.invalidateSize(); return; }
+  const bounds = L.latLngBounds(L.latLng(BRGY.swLat, BRGY.swLng), L.latLng(BRGY.neLat, BRGY.neLng));
+  streetPinMap = L.map('streetPinMap', { zoomControl:true, minZoom:14, maxZoom:19, maxBounds:bounds, maxBoundsViscosity:1.0 })
+    .setView([BRGY.lat, BRGY.lng], BRGY.zoom);
+
+  if (curLayer === 'satellite') {
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {maxZoom:19}).addTo(streetPinMap);
+  } else {
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19}).addTo(streetPinMap);
+  }
+
+  // Show barangay boundary on street pin map
+  // Boundary polygon removed
+
+  streetPinMap.on('click', function(e) {
+    placeStreetPin(e.latlng.lat.toFixed(6), e.latlng.lng.toFixed(6));
+  });
+  setTimeout(() => streetPinMap.invalidateSize(), 200);
+}
+
+function placeStreetPin(lat, lng) {
+  const ic = L.divIcon({ className:'', html:`<div style="text-align:center"><div style="font-size:28px;filter:drop-shadow(0 2px 4px rgba(0,0,0,.4))">📍</div><div style="background:#0f4a27;color:#fff;border-radius:4px;padding:1px 5px;font-size:9px;font-weight:700;margin-top:-4px;white-space:nowrap">Street Pin</div></div>`, iconSize:[64,44], iconAnchor:[20,38] });
+  if (streetPinMarker) streetPinMap.removeLayer(streetPinMarker);
+  streetPinMarker = L.marker([+lat, +lng], { icon:ic, draggable:true }).addTo(streetPinMap);
+  streetPinMarker.on('dragend', function() {
+    const p = streetPinMarker.getLatLng();
+    placeStreetPin(p.lat.toFixed(6), p.lng.toFixed(6));
+  });
+  qs('#nsLat').value = lat;
+  qs('#nsLng').value = lng;
+  qs('#streetPinCoord').textContent = `${lat}, ${lng}`;
+  qs('#streetPinInfo').style.display = 'flex';
+  qs('#streetPinEmpty').style.display = 'none';
+}
+
+function clearStreetPin() {
+  if (streetPinMarker && streetPinMap) { streetPinMap.removeLayer(streetPinMarker); streetPinMarker = null; }
+  qs('#nsLat').value = '';
+  qs('#nsLng').value = '';
+  qs('#streetPinInfo').style.display = 'none';
+  qs('#streetPinEmpty').style.display = 'block';
+}
+
+function addStreet() {
+  const name = qs('#nsName').value.trim();
+  const lat  = qs('#nsLat').value;
+  const lng  = qs('#nsLng').value;
+  const e    = qs('#nsErr');
+  if (!name) { e.textContent = 'Street name is required.'; e.style.display='block'; return; }
+  e.style.display = 'none';
+  apiPost('street_add', { name, description: qs('#nsDesc').value.trim(), lat: lat||null, lng: lng||null }).then(r => {
+    if (r.error) { e.textContent = r.error; e.style.display='block'; return; }
+    qs('#nsName').value = '';
+    qs('#nsDesc').value = '';
+    clearStreetPin();
+    loadAdminStreets(); loadStreetSidebar(); loadMapData(); loadStats();
+    toast('✅ Street added!');
+  });
+}
+
+
+
+// ===================== USERS (Super Admin only) =====================
+function loadUsers() {
+  const table = qs('#usersTable');
+  if (!table) return;
+  table.innerHTML = '<div class="loading-state">Loading...</div>';
+  const me = currentUser();
+  api('users').then(users=>{
+    if (!users.length) { table.innerHTML = '<div class="hint">No accounts found.</div>'; return; }
+    table.innerHTML = `<table><thead><tr><th>Name</th><th>Username</th><th>Gmail</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody>${users.map(u=>{
+        const isSelf = me && me.id === u.id;
+        const roleLabel = u.role === 'super_admin'
+          ? '<span class="badge" style="background:#ede7f6;color:#5e35b1">👑 Super Admin</span>'
+          : '<span class="badge" style="background:#e3f2fd;color:#1565c0">Admin</span>';
+        const statusBadge = u.is_active
+          ? '<span class="badge" style="background:#e8f5e9;color:#2e7d32">Active</span>'
+          : '<span class="badge" style="background:#ffebee;color:#c62828">Inactive</span>';
+        const toggleBtn = isSelf
+          ? '<span class="hint" style="font-size:.72rem">This is you</span>'
+          : `<button class="btn-${u.is_active?'del':'edit'}" onclick="toggleUser(${u.id},${u.is_active?0:1})">${u.is_active?'Deactivate':'Activate'}</button>
+             <button class="btn-del" style="margin-left:6px" onclick="deleteUserAccount(${u.id},'${escH(u.full_name).replace(/'/g,"\\'")}')">🗑 Delete</button>`;
+        return `<tr>
+          <td>${escH(u.full_name)}</td>
+          <td>${escH(u.username)}</td>
+          <td>${escH(u.email || '—')}</td>
+          <td>${roleLabel}</td>
+          <td>${statusBadge}</td>
+          <td>${toggleBtn}</td>
+        </tr>`;
+      }).join('')}</tbody></table>`;
+  });
+}
+
+// ===================== ACTIVITY LOG (Super Admin only) =====================
+function activityActionMeta(action) {
+  const map = {
+    login:               { label: 'Logged In',          color: '#2d5fa6' },
+    logout:               { label: 'Logged Out',         color: '#777' },
+    update_profile:        { label: 'Updated Profile',    color: '#2d5fa6' },
+    change_password:       { label: 'Changed Password',   color: '#b06010' },
+    forgot_password_request: { label: 'Requested Reset',  color: '#b06010' },
+    reset_password_confirm:  { label: 'Reset Password',   color: '#b06010' },
+    purok_add:             { label: 'Added Purok',        color: '#1f5c32' },
+    purok_delete:          { label: 'Deleted Purok',      color: '#c0392b' },
+    street_add:            { label: 'Added Street',       color: '#1f5c32' },
+    street_delete:         { label: 'Deleted Street',     color: '#c0392b' },
+    house_add:             { label: 'Added House',        color: '#1f5c32' },
+    house_edit:            { label: 'Edited House',       color: '#2d5fa6' },
+    house_delete:          { label: 'Deleted House',      color: '#c0392b' },
+    member_add:            { label: 'Added Resident',      color: '#1f5c32' },
+    member_edit:           { label: 'Edited Resident',     color: '#2d5fa6' },
+    member_delete:         { label: 'Deleted Resident',    color: '#c0392b' },
+    facility_add:          { label: 'Added Facility',     color: '#1f5c32' },
+    facility_edit:         { label: 'Edited Facility',    color: '#2d5fa6' },
+    facility_delete:       { label: 'Deleted Facility',   color: '#c0392b' },
+    incident_report:       { label: 'Incident Reported',  color: '#b06010' },
+    incident_approve:      { label: 'Incident Approved',  color: '#1f5c32' },
+    incident_reject:       { label: 'Incident Rejected',  color: '#c0392b' },
+    incident_update:       { label: 'Incident Updated',   color: '#2d5fa6' },
+    incident_delete:       { label: 'Incident Deleted',   color: '#c0392b' },
+    user_create:           { label: 'Admin Created',      color: '#1f5c32' },
+    user_toggle:           { label: 'Admin Activated/Deactivated', color: '#b06010' },
+    user_delete:           { label: 'Admin Deleted',      color: '#c0392b' },
+    user_role:             { label: 'Role Changed',       color: '#b06010' },
+    bulk_import:           { label: 'Bulk Import',        color: '#2d5fa6' },
+  };
+  return map[action] || { label: action, color: '#777' };
+}
+
+function loadActivityLog() {
+  const tbody = qs('#alTableBody');
+  if (!tbody) return;
+  tbody.innerHTML = '<tr><td colspan="5" class="loading-state">Loading...</td></tr>';
+
+  // Populate the account filter once
+  const userSel = qs('#alUser');
+  if (userSel && userSel.options.length <= 1) {
+    api('activity_log_users').then(users => {
+      userSel.innerHTML = '<option value="">All Accounts</option>' +
+        users.map(u => `<option value="${escH(u.username)}">${escH(u.full_name)} (${escH(u.username)})</option>`).join('');
+    });
+  }
+
+  const username = qs('#alUser') ? qs('#alUser').value : '';
+  const actionFilter = qs('#alAction') ? qs('#alAction').value : '';
+  let url = 'activity_logs';
+  const params = [];
+  if (username) params.push(`username=${encodeURIComponent(username)}`);
+  // NOTE: can't call this param "action" — it collides with the ?action=
+  // routing parameter the whole API uses, so the server-side filter uses
+  // "log_action" instead.
+  if (actionFilter) params.push(`log_action=${encodeURIComponent(actionFilter)}`);
+  if (params.length) url += '&' + params.join('&');
+
+  api(url).then(logs => {
+    if (!Array.isArray(logs)) {
+      // Something went wrong server-side (auth, SQL error, missing table, etc.)
+      // — show the real reason instead of pretending there's just no data.
+      const msg = (logs && logs.error) ? logs.error : 'Could not load the activity log. Check the browser console / Network tab for details.';
+      tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:24px;color:#c0392b;font-size:.84rem">⚠ ${escH(msg)}</td></tr>`;
+      console.error('activity_logs response:', logs);
+      return;
+    }
+    if (!logs.length) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:24px;color:var(--ink-lt);font-size:.84rem">No activity recorded yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = logs.map(l => {
+      const meta = activityActionMeta(l.action);
+      const roleLabel = l.role === 'super_admin' ? '👑 Super Admin' : (l.role === 'admin' ? 'Admin' : '—');
+      const who = l.full_name ? `${escH(l.full_name)} <span style="color:var(--ink-lt);font-size:.72rem">(${escH(l.username)})</span>` : '<span style="color:var(--ink-lt)">Anonymous / Public</span>';
+      return `<tr>
+        <td style="white-space:nowrap;font-size:.78rem">${fmtIncidentDate(l.created_at)}</td>
+        <td style="font-size:.82rem">${who}<br><span style="font-size:.68rem;color:var(--ink-lt)">${roleLabel}</span></td>
+        <td><span style="background:${meta.color}14;color:${meta.color};border:1px solid ${meta.color}40;border-radius:20px;padding:2px 9px;font-size:.70rem;font-weight:700;white-space:nowrap">${meta.label}</span></td>
+        <td style="font-size:.80rem;max-width:320px">${escH(l.description || '—')}</td>
+        <td style="font-size:.74rem;color:var(--ink-lt);white-space:nowrap">${escH(l.ip_address || '—')}</td>
+      </tr>`;
+    }).join('');
+  });
+}
+
+function addAdminAccount() {
+  const name = qs('#uaName').value.trim();
+  const user = qs('#uaUser').value.trim();
+  const pass = qs('#uaPass').value;
+  const email = qs('#uaEmail').value.trim();
+  const e = qs('#uaErr');
+  e.style.display = 'none';
+  if (!name || !user || !pass || !email) { e.textContent = 'Full name, username, password and Gmail are required.'; e.style.display = 'block'; return; }
+  if (pass.length < 6) { e.textContent = 'Password must be at least 6 characters.'; e.style.display = 'block'; return; }
+  if (!/^[^\s@]+@gmail\.com$/i.test(email)) { e.textContent = 'Please enter a valid Gmail address (must end in @gmail.com).'; e.style.display = 'block'; return; }
+  apiPost('user_create', { full_name: name, username: user, password: pass, email }).then(r=>{
+    if (r.error) { e.textContent = r.error; e.style.display = 'block'; return; }
+    qs('#uaName').value = ''; qs('#uaUser').value = ''; qs('#uaPass').value = ''; qs('#uaEmail').value = '';
+    loadUsers();
+    toast(`✅ Admin account "${user}" created.`);
+  });
+}
+
+function toggleUser(id, val) {
+  apiPost('user_toggle', { id, is_active: val }).then(r=>{
+    if (r.success) { loadUsers(); toast(val ? 'Account activated.' : 'Account deactivated.'); }
+    else toast('Error: ' + (r.error || 'Could not update account.'));
+  });
+}
+
+function deleteUserAccount(id, name) {
+  if (!confirm(`Permanently delete "${name}"'s account?\n\nThis cannot be undone. Their past incident reports, facilities, and import history will stay on record but will no longer show who handled them.`)) return;
+  apiPost('user_delete', { id }).then(r=>{
+    if (r.success) { loadUsers(); toast(`"${name}" was deleted.`); }
+    else toast('Error: ' + (r.error || 'Could not delete account.'));
+  });
+}
+
+function handleFile(inp) {
+  if(inp.files.length){qs('#selFileName').textContent=inp.files[0].name;qs('#selFile').style.display='flex';qs('#fileDrop').style.display='none';}
+}
+function clearFile(){qs('#csvFile').value='';qs('#selFile').style.display='none';qs('#fileDrop').style.display='block';}
+
+function doBulkImport() {
+  const fi=qs('#csvFile'),re=qs('#importResult'),btn=qs('#importBtn');
+  if(!fi.files.length){alert('Select a CSV file first.');return;}
+  const fd=new FormData();fd.append('csv_file',fi.files[0]);
+  btn.disabled=true;btn.textContent='Importing...';re.style.display='none';
+  fetch(`${API}?action=bulk_import`,{method:'POST',body:fd}).then(r=>r.json()).then(r=>{
+    btn.disabled=false;btn.textContent='Import Data';
+    re.className='import-result '+(r.error?'error':'success');
+    re.textContent=r.error?'❌ '+r.error:'✅ '+r.message;
+    re.style.display='block';
+    if(!r.error){loadMapData();loadStats();loadStreetSidebar();}
+  }).catch(()=>{btn.disabled=false;btn.textContent='Import Data';re.className='import-result error';re.textContent='❌ Network error.';re.style.display='block';});
+}
+
+
+
+// ===================== PUROK PIN MAP =====================
+let purokPinMap = null;
+let purokPinMarker = null;
+
+function initPurokPinMap() {
+  if (purokPinMap) { purokPinMap.invalidateSize(); return; }
+  const bounds = L.latLngBounds(L.latLng(BRGY.swLat, BRGY.swLng), L.latLng(BRGY.neLat, BRGY.neLng));
+  purokPinMap = L.map('purokPinMap', { zoomControl:true, minZoom:14, maxZoom:19, maxBounds:bounds, maxBoundsViscosity:1.0 })
+    .setView([BRGY.lat, BRGY.lng], BRGY.zoom);
+
+  if (curLayer === 'satellite') {
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {maxZoom:19}).addTo(purokPinMap);
+  } else {
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19}).addTo(purokPinMap);
+  }
+
+  // Boundary polygon removed
+
+  purokPinMap.on('click', function(e) {
+    placePurokPin(e.latlng.lat.toFixed(6), e.latlng.lng.toFixed(6));
+  });
+  setTimeout(() => purokPinMap.invalidateSize(), 200);
+}
+
+function placePurokPin(lat, lng) {
+  const ic = L.divIcon({ className:'', html:`<div style="text-align:center"><div style="font-size:28px;filter:drop-shadow(0 2px 4px rgba(0,0,0,.4))">📍</div><div style="background:#0f4a27;color:#fff;border-radius:4px;padding:1px 5px;font-size:9px;font-weight:700;margin-top:-4px;white-space:nowrap">Purok Pin</div></div>`, iconSize:[64,44], iconAnchor:[20,38] });
+  if (purokPinMarker) purokPinMap.removeLayer(purokPinMarker);
+  purokPinMarker = L.marker([+lat, +lng], { icon:ic, draggable:true }).addTo(purokPinMap);
+  purokPinMarker.on('dragend', function() {
+    const p = purokPinMarker.getLatLng();
+    placePurokPin(p.lat.toFixed(6), p.lng.toFixed(6));
+  });
+  qs('#purokLat').value = lat;
+  qs('#purokLng').value = lng;
+  qs('#purokPinCoord').textContent = `${lat}, ${lng}`;
+  qs('#purokPinInfo').style.display = 'flex';
+  qs('#purokPinEmpty').style.display = 'none';
+}
+
+function clearPurokPin() {
+  if (purokPinMarker && purokPinMap) { purokPinMap.removeLayer(purokPinMarker); purokPinMarker = null; }
+  qs('#purokLat').value = '';
+  qs('#purokLng').value = '';
+  qs('#purokPinInfo').style.display = 'none';
+  qs('#purokPinEmpty').style.display = 'block';
+}
+
+// ===================== PUROKS =====================
+function loadAdminPuroks() {
+  const list = qs('#adminPurokList');
+  if (!list) return;
+  list.innerHTML = '<div class="loading-state">Loading...</div>';
+  loadAllStreets('purokStreet');
+  api('puroks').then(puroks => {
+    if (!puroks.length) {
+      list.innerHTML = '<p class="hint" style="padding:8px">No puroks yet. Add one above.</p>';
+      return;
+    }
+    const u = currentUser();
+    const canDelete = isSuperAdminUser(u);
+    list.innerHTML = puroks.map(p => `
+      <div class="admin-street-item">
+        <div>
+          <strong>${p.name}</strong>
+          <span style="color:var(--ink-lt);font-size:.78rem;margin-left:6px">on ${p.street_name}</span>
+          ${p.description ? `<span style="color:var(--ink-lt);font-size:.78rem;margin-left:6px">— ${p.description}</span>` : ''}
+          <div style="margin-top:3px;font-size:.74rem;color:var(--ink-lt)">
+            🏠 ${p.house_count} houses &nbsp;·&nbsp; 👥 ${p.population} residents
+          </div>
+        </div>
+        ${canDelete ? `<button class="btn-del" data-id="${p.id}" data-name="${escH(p.name)}" onclick="deletePurok(this)">Delete</button>` : ''}
+      </div>`).join('');
+  });
+}
+
+function addPurok() {
+  const sid  = qs('#purokStreet').value;
+  const name = qs('#purokName').value.trim();
+  const desc = qs('#purokDesc').value.trim();
+  const lat  = qs('#purokLat').value;
+  const lng  = qs('#purokLng').value;
+  const e = qs('#purokErr');
+  if (!sid) { e.textContent = 'Please select a parent street.'; e.style.display = 'block'; return; }
+  if (!name) { e.textContent = 'Purok name is required.'; e.style.display = 'block'; return; }
+  e.style.display = 'none';
+  apiPost('purok_add', { street_id: sid, name, description: desc, lat: lat||null, lng: lng||null }).then(r => {
+    if (r.error) { e.textContent = r.error; e.style.display = 'block'; return; }
+    qs('#purokStreet').value = '';
+    qs('#purokName').value = '';
+    qs('#purokDesc').value = '';
+    clearPurokPin();
+    loadAdminPuroks();
+    // Re-init map so it's ready for next entry
+    purokPinMap = null;
+    setTimeout(initPurokPinMap, 100);
+    toast('Purok added!');
+  });
+}
+
+function deletePurok(btn) {
+  const id = btn.dataset.id;
+  const name = btn.dataset.name;
+  if (!confirm(`Delete Purok "${name}" and ALL its houses & members? This cannot be undone.`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Deleting...';
+  apiPost('purok_delete', { id: parseInt(id) }).then(r => {
+    if (r.success) {
+      loadAdminPuroks();
+      loadStreetSidebar();
+      loadMapData();
+      loadStats();
+      toast('Purok deleted.');
+    } else {
+      btn.disabled = false;
+      btn.textContent = 'Delete';
+      toast('Error: ' + (r.error || 'Could not delete.'));
+    }
+  });
+}
+
+
+// ===================== HOUSE FORM LOADERS =====================
+function loadAllStreets(streetSelId) {
+  api('streets').then(streets => {
+    const sel = qs('#' + streetSelId);
+    if (!sel) return;
+    sel.innerHTML = '<option value="">Select street...</option>' +
+      streets.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+  });
+}
+
+function loadAllPuroks(purokSelId) {
+  api('puroks').then(puroks => {
+    const sel = qs('#' + purokSelId);
+    if (!sel) return;
+    if (!puroks.length) {
+      sel.innerHTML = '<option value="">No puroks yet — add one in Admin</option>';
+      return;
+    }
+    sel.innerHTML = '<option value="">Select purok...</option>' +
+      puroks.map(p => `<option value="${p.id}" data-street="${p.street_id}">${p.name}</option>`).join('');
+  });
+}
+
+// Loads puroks belonging to a specific street into a <select>, optionally pre-selecting one
+function loadPuroksForStreet(streetId, purokSelId, preselectId) {
+  const sel = qs('#' + purokSelId);
+  if (!sel) return;
+  if (!streetId) {
+    sel.innerHTML = '<option value="">Select a street first...</option>';
+    return;
+  }
+  sel.innerHTML = '<option value="">Loading...</option>';
+  api('puroks').then(puroks => {
+    const filtered = puroks.filter(p => String(p.street_id) === String(streetId));
+    if (!filtered.length) {
+      sel.innerHTML = '<option value="">No puroks for this street — add one in Admin</option>';
+      return;
+    }
+    sel.innerHTML = '<option value="">Select purok...</option>' +
+      filtered.map(p => `<option value="${p.id}" ${preselectId && p.id==preselectId?'selected':''}>${p.name}</option>`).join('');
+  });
+}
+
+function onAdminHouseStreetChange() {
+  const sid = qs('#ahAdminStreet').value;
+  loadPuroksForStreet(sid, 'ahAdminPurok');
+}
+
+function onHouseStreetChange() {
+  const sid = qs('#ahStreet').value;
+  loadPuroksForStreet(sid, 'ahPurok');
+}
+
+
+// ===================== AGE GROUP HELPER =====================
+function calcAgeGroup(birthDateStr) {
+  if (!birthDateStr) return 'adult';
+  const today = new Date();
+  const birth = new Date(birthDateStr);
+  let age = today.getFullYear() - birth.getFullYear();
+  const m = today.getMonth() - birth.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < birth.getDate())) age--;
+  if (age <= 11) return 'child';
+  if (age >= 60) return 'senior';
+  return 'adult';
+}
+
+function ageGroupLabel(birthDateStr) {
+  const g = calcAgeGroup(birthDateStr);
+  if (g === 'child')  return '👶 Child';
+  if (g === 'senior') return '👴 Senior Citizen';
+  return '🧑 Adult';
+}
+
+function calcAge(birthDateStr) {
+  if (!birthDateStr) return '?';
+  const today = new Date();
+  const birth = new Date(birthDateStr);
+  let age = today.getFullYear() - birth.getFullYear();
+  const m = today.getMonth() - birth.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < birth.getDate())) age--;
+  return age;
+}
+
+// ===================== AUTH =====================
+let _user = null;
+function currentUser(){return _user;}
+// Any staff account — Super Admin or regular Admin (day-to-day operations)
+function isStaff(u){ u = u || _user; return !!(u && (u.role === 'admin' || u.role === 'super_admin')); }
+// Super Admin only — delete/dismiss actions and account management
+function isSuperAdminUser(u){ u = u || _user; return !!(u && u.role === 'super_admin'); }
+
+// ===================== PROFILE / CHANGE PASSWORD =====================
+function openProfileModal() {
+  const u = currentUser();
+  if (!u) return;
+  qs('#profileName').textContent = u.full_name || u.username;
+  qs('#profileRole').textContent = u.role === 'super_admin' ? 'Super Admin — Barangay Captain' : 'Admin — Barangay Official';
+  qs('#profileAvatar').textContent = (u.full_name || u.username || 'A').charAt(0).toUpperCase();
+  qs('#profEditName').value = u.full_name || '';
+  qs('#profEditUser').value = u.username || '';
+  qs('#profEditEmail').value = u.email || '';
+  qs('#profInfoErr').style.display = 'none';
+  qs('#pCurrentPass').value = '';
+  qs('#pNewPass').value = '';
+  qs('#pConfirmPass').value = '';
+  qs('#profileErr').style.display = 'none';
+  qs('#profileOk').style.display = 'none';
+  openModal('profileModal');
+}
+
+function saveProfileInfo() {
+  const fullName = qs('#profEditName').value.trim();
+  const email = qs('#profEditEmail').value.trim();
+  const err = qs('#profInfoErr');
+  err.style.display = 'none';
+
+  if (!fullName) { err.textContent = 'Full name is required.'; err.style.display = 'block'; return; }
+  if (email && !/^[^\s@]+@gmail\.com$/i.test(email)) {
+    err.textContent = 'Please enter a valid Gmail address (must end in @gmail.com).';
+    err.style.display = 'block';
+    return;
+  }
+
+  apiPost('update_profile', { full_name: fullName, email }).then(r => {
+    if (r.error) { err.textContent = r.error; err.style.display = 'block'; return; }
+    _user = r.user;
+    qs('#profileName').textContent = _user.full_name;
+    qs('#profileAvatar').textContent = (_user.full_name || _user.username || 'A').charAt(0).toUpperCase();
+    qs('#userBadge').textContent = `${_user.full_name} (${isSuperAdminUser(_user) ? 'Super Admin' : 'Admin'})`;
+    toast('✅ Profile updated.');
+  });
+}
+
+function submitPasswordChange() {
+  const current = qs('#pCurrentPass').value;
+  const next    = qs('#pNewPass').value;
+  const confirm = qs('#pConfirmPass').value;
+  const err = qs('#profileErr');
+  const ok  = qs('#profileOk');
+  err.style.display = 'none';
+  ok.style.display = 'none';
+
+  if (!current) { err.textContent = 'Please enter your current password.'; err.style.display = 'block'; return; }
+  if (!next || next.length < 6) { err.textContent = 'New password must be at least 6 characters.'; err.style.display = 'block'; return; }
+  if (next !== confirm) { err.textContent = 'New password and confirmation do not match.'; err.style.display = 'block'; return; }
+
+  apiPost('change_password', { current_password: current, new_password: next }).then(r => {
+    if (r.error) { err.textContent = r.error; err.style.display = 'block'; return; }
+    ok.style.display = 'block';
+    qs('#pCurrentPass').value = '';
+    qs('#pNewPass').value = '';
+    qs('#pConfirmPass').value = '';
+    toast('✅ Password updated.');
+    setTimeout(() => closeModal('profileModal'), 1200);
+  });
+}
+
+// ===================== PASSWORD VISIBILITY TOGGLE =====================
+const EYE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+
+function togglePasswordVisibility(inputId, btn) {
+  const input = qs('#' + inputId);
+  if (!input) return;
+  if (input.type === 'password') {
+    input.type = 'text';
+    btn.innerHTML = EYE_OFF_ICON;
+    btn.title = 'Hide password';
+  } else {
+    input.type = 'password';
+    btn.innerHTML = EYE_ICON;
+    btn.title = 'Show password';
+  }
+}
+
+
+function submitForgotPassword() {
+  const username = qs('#fpUser').value.trim();
+  const email = qs('#fpEmail').value.trim();
+  const err = qs('#fpErr');
+  const ok = qs('#fpOk');
+  err.style.display = 'none';
+  ok.style.display = 'none';
+
+  if (!username || !email) { err.textContent = 'Please enter your username and Gmail address.'; err.style.display = 'block'; return; }
+  if (!/^[^\s@]+@gmail\.com$/i.test(email)) { err.textContent = 'Please enter a valid Gmail address.'; err.style.display = 'block'; return; }
+
+  apiPost('forgot_password', { username, email }).then(r => {
+    if (r.error) { err.textContent = r.error; err.style.display = 'block'; return; }
+    ok.style.display = 'block';
+    qs('#fpUser').value = '';
+    qs('#fpEmail').value = '';
+  });
+}
+
+function checkForPasswordResetLink() {
+  const token = new URLSearchParams(window.location.search).get('reset_token');
+  if (!token) return;
+  qs('#rpToken').value = token;
+  qs('#rpNewPass').value = '';
+  qs('#rpConfirmPass').value = '';
+  qs('#rpErr').style.display = 'none';
+  qs('#rpOk').style.display = 'none';
+  openModal('resetPassModal');
+}
+
+function cancelPasswordReset() {
+  closeModal('resetPassModal');
+  // Strip the token out of the URL so refreshing doesn't reopen this modal
+  const url = new URL(window.location.href);
+  url.searchParams.delete('reset_token');
+  window.history.replaceState({}, '', url.toString());
+}
+
+function submitResetPassword() {
+  const token = qs('#rpToken').value;
+  const next = qs('#rpNewPass').value;
+  const confirm = qs('#rpConfirmPass').value;
+  const err = qs('#rpErr');
+  const ok = qs('#rpOk');
+  err.style.display = 'none';
+  ok.style.display = 'none';
+
+  if (!next || next.length < 6) { err.textContent = 'New password must be at least 6 characters.'; err.style.display = 'block'; return; }
+  if (next !== confirm) { err.textContent = 'New password and confirmation do not match.'; err.style.display = 'block'; return; }
+
+  apiPost('reset_password_confirm', { token, new_password: next }).then(r => {
+    if (r.error) { err.textContent = r.error; err.style.display = 'block'; return; }
+    ok.style.display = 'block';
+    setTimeout(() => {
+      cancelPasswordReset();
+      openModal('loginModal');
+      toast('✅ Password updated — you can log in now.');
+    }, 1500);
+  });
+}
+
+// Hides the public Login button by default so casual visitors never see it.
+// Staff access it via a bookmarked link containing ?admin — once visited,
+// the flag is remembered on that device/browser going forward.
+function hasStaffAccessFlag() {
+  if (new URLSearchParams(window.location.search).has('admin')) {
+    localStorage.setItem('inspire_staff_access', '1');
+  }
+  return localStorage.getItem('inspire_staff_access') === '1';
+}
+
+function checkAuth() {
+  api('me').then(d=>{
+    _user=d.user||null;
+    const loggedIn=!!_user;
+    const isOff = isStaff(_user);
+    const isSuper = isSuperAdminUser(_user);
+    qs('#loginBtn').style.display = loggedIn ? 'none' : (hasStaffAccessFlag() ? '' : 'none');
+    qs('#navUser').style.display=loggedIn?'flex':'none';
+    // Show nav tabs ONLY for logged-in staff (admin/super_admin)
+    qsa('.admin-nav-tab').forEach(b=>b.style.display=isOff?'':'none');
+    if(_user){
+      const roleLabel = isSuper ? 'Super Admin' : 'Admin';
+      qs('#userBadge').textContent=`${_user.full_name} (${roleLabel})`;
+      qsa('#addFacilityBtn').forEach(b=>b.style.display=isOff?'':'none');
+      syncAlertMuteBtn();
+    // Mobile nav admin tabs
+    qsa('.mob-nav-btn.admin-nav-tab').forEach(b=>b.style.display=isOff?'flex':'none');
+      qsa('.admin-only-tab').forEach(b=>b.style.display=isOff?'':'none');
+      qsa('.superadmin-only-tab').forEach(b=>b.style.display=isSuper?'':'none');
+    }
+    // Report Incident button: guests only (staff manage via dashboard)
+    const showReport = !isOff;
+    const sidebarBtn = qs('#reportIncidentSidebarBtn');
+    const officialNote = qs('#officialIncidentNote');
+    const pageBtn = qs('#reportIncidentPageBtn');
+    const floatBtn = qs('#mapReportBtn');
+    const navPill = qs('.mob-nav-report-wrap');
+    const csBtn3 = qs('#checkStatusBtn');
+    if (sidebarBtn) sidebarBtn.style.display = showReport ? '' : 'none';
+    if (officialNote) officialNote.style.display = isOff ? '' : 'none';
+    if (pageBtn) pageBtn.style.display = showReport ? '' : 'none';
+    if (floatBtn) floatBtn.style.display = showReport ? '' : 'none';
+    if (navPill) navPill.style.display = showReport ? '' : 'none';
+    if (csBtn3) csBtn3.style.display = showReport ? '' : 'none';
+
+    // Start/stop incident notification polling based on staff login state
+    if (isOff) startIncidentPolling();
+    else stopIncidentPolling();
+
+    // Re-render map markers now that we know the real auth state — loadMapData()
+    // runs once synchronously during initMap() (before this async check resolves),
+    // so popups built at that moment never had Manage buttons for a logged-in user.
+    if (typeof map !== 'undefined' && map) loadMapData();
+  });
+}
+
+function doLogin() {
+  const u=qs('#lUser').value.trim(),p=qs('#lPass').value,e=qs('#loginErr');
+  e.style.display='none';
+  apiPost('login',{username:u,password:p}).then(r=>{
+    if(r.error){e.textContent=r.error;e.style.display='block';return;}
+    _user=r.user;
+    closeModal('loginModal');
+    checkAuth();
+    // Reload map markers — officials see pending pins, residents see only approved
+    loadMapData();
+    loadStats();
+    if(isStaff(r.user)){
+      showPage('admin');
+      toast(`Welcome, ${r.user.full_name}!`);
+    } else {
+      showPage('map');
+      toast(`Welcome, ${r.user.full_name}!`);
+    }
+  });
+}
+
+function doRegister() {
+  const d={full_name:qs('#rName').value.trim(),username:qs('#rUser').value.trim(),password:qs('#rPass').value,contact:qs('#rContact').value.trim()};
+  const e=qs('#regErr');e.style.display='none';
+  if(!d.full_name||!d.username||!d.password){e.textContent='All required fields must be filled.';e.style.display='block';return;}
+  apiPost('register',d).then(r=>{
+    if(r.error){e.textContent=r.error;e.style.display='block';return;}
+    qs('#rName').value='';qs('#rUser').value='';qs('#rPass').value='';qs('#rContact').value='';
+    ltab('login');toast('✅ Registered! Please log in.');
+  });
+}
+
+function doLogout(){
+  api('logout').then(()=>{
+    _user=null;
+    stopIncidentPolling();
+    checkAuth();
+    showPage('map');
+    loadMapData(); // removes pending-only incident pins from view
+    loadStats();
+    toast('Logged out.');
+  });
+}
+
+function ltab(t) {
+  qsa('.ltab').forEach((b,i)=>b.classList.toggle('active',['login','register'][i]===t));
+  qs('#lt-login').style.display=t==='login'?'':'none';
+  qs('#lt-register').style.display=t==='register'?'':'none';
+}
+
+// ===================== NAVIGATION =====================
+function showPage(pg) {
+  // Guard pages that require login
+  const restricted = ['population','facilities','incidents','admin'];
+  if(restricted.includes(pg) && !isStaff(_user)){
+    openModal('loginModal');
+    return;
+  }
+  qsa('.page').forEach(p=>p.classList.remove('active'));
+  qsa('.nav-btn[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===pg));
+  // Sync mobile nav
+  const mobMap = {map:'mnMap',population:'mnPop',incidents:'mnInc',admin:'mnAdmin'};
+  qsa('.mob-nav-btn').forEach(b=>b.classList.remove('active'));
+  const activeMob = mobMap[pg] ? qs('#'+mobMap[pg]) : null;
+  if (activeMob) activeMob.classList.add('active');
+  const el=qs(`#page-${pg}`);
+  if(el) el.classList.add('active');
+  if(pg==='map'){setTimeout(()=>{if(map)map.invalidateSize();},100);loadStreetSidebar();}
+  if(pg==='population') loadPopulationPage();
+  if(pg==='facilities') { showPage('admin'); setTimeout(()=>adminTab('facilities'),100); return; }
+  if(pg==='incidents') { loadIncidentReport(); }
+  if(pg==='admin') loadAdminPage();
+  // Show/hide report incident buttons — only on the map page, and only for guests
+  const onMap = pg === 'map' && !isStaff(_user);
+  const floatBtn = qs('#mapReportBtn');
+  const navPill = qs('.mob-nav-report-wrap');
+  const csBtn4 = qs('#checkStatusBtn');
+  if (csBtn4) csBtn4.style.display = onMap ? '' : 'none';
+  if(floatBtn) floatBtn.style.display = onMap ? '' : 'none';
+  if(navPill) navPill.style.display = onMap ? '' : 'none';
+}
+
+// ===================== MODALS =====================
+function openModal(id){qs('#'+id).classList.add('show');}
+function closeModal(id){qs('#'+id).classList.remove('show');}
+
+// Photo proof lightbox — base64 photos are data: URIs, which most browsers
+// block from opening via window.open() in a new tab (shows a blank page).
+// Showing it in an in-page overlay instead avoids that entirely.
+function openPhotoLightbox(src) {
+  qs('#photoLightboxImg').src = src;
+  qs('#photoLightbox').classList.add('show');
+}
+function closePhotoLightbox() {
+  qs('#photoLightbox').classList.remove('show');
+  qs('#photoLightboxImg').src = '';
+}
+function e(event){event.stopPropagation();}
+window.addEventListener('keydown',ev=>{if(ev.key==='Escape') qsa('.modal-overlay.show').forEach(m=>m.classList.remove('show'));});
+
+// ===================== HELPERS =====================
+function api(action){return fetch(`${API}?action=${action}`).then(r=>r.json()).catch(()=>({}));}
+function apiPost(action,data){return fetch(`${API}?action=${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(r=>r.json()).catch(()=>({error:'Network error'}));}
+function qs(s){return document.querySelector(s);}
+function qsa(s){return document.querySelectorAll(s);}
+function fmt(n){return parseInt(n||0).toLocaleString();}
+function escH(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function resetPinUI(showId,emptyId){qs('#'+showId).style.display='none';qs('#'+emptyId).style.display='block';}
+
+function toast(msg,dur=4000) {
+  let t=document.getElementById('toast');
+  if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0f4a27;color:#fff;padding:11px 22px;border-radius:10px;font-family:Inter,sans-serif;font-size:.86rem;font-weight:600;box-shadow:0 4px 20px rgba(0,0,0,.3);z-index:9999;transition:opacity .35s;opacity:0;pointer-events:none;white-space:nowrap';document.body.appendChild(t);}
+  t.textContent=msg;t.style.opacity='1';
+  clearTimeout(t._timer);t._timer=setTimeout(()=>t.style.opacity='0',dur);
+}
+
+// Facility/Incident icon helpers
+function facIcon(cat){return{government:'🏛',health:'🏥',education:'🏫',religious:'⛪',commercial:'🏪',infrastructure:'🔧',landmark:'📍',other:'📌'}[cat]||'📌';}
+function facLabel(cat){return{government:'Government',health:'Health Center',education:'School/Education',religious:'Religious',commercial:'Commercial',infrastructure:'Infrastructure',landmark:'Landmark',other:'Other'}[cat]||cat;}
+function incIcon(cat){return{fire:'🔥',flood:'🌊',accident:'🚗',crime:'🚔',medical:'🏥',infrastructure:'🔧',other:'📋'}[cat]||'📋';}
+function incLabel(cat){return{fire:'Fire',flood:'Flood/Water',accident:'Accident',crime:'Crime/Security',medical:'Medical Emergency',infrastructure:'Infrastructure',other:'Other'}[cat]||cat;}
+
+// ===================== INCIDENT POPUP CARD =====================
+function fmtIncidentDate(dateStr) {
+  if (!dateStr) return '—';
+  const d = new Date(String(dateStr).replace(' ', 'T'));
+  if (isNaN(d.getTime())) return dateStr;
+  const datePart = d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+  const timePart = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+  return `${datePart} · ${timePart}`;
+}
+
+function incStatusMeta(status) {
+  const map = {
+    open:          { label: 'REPORTED',      color: '#b06010' },
+    investigating: { label: 'INVESTIGATING', color: '#2d5fa6' },
+    resolved:      { label: 'RESOLVED',       color: '#1f5c32' },
+    closed:        { label: 'CLOSED',         color: '#777'    },
+  };
+  return map[status] || map.open;
+}
+
+function incVisibilityInfo(i) {
+  if (!i.approved || i.approved != 1 || !i.approved_at) return null;
+  const approvedTime = new Date(String(i.approved_at).replace(' ', 'T')).getTime();
+  if (isNaN(approvedTime)) return null;
+  const totalMs = 12 * 60 * 60 * 1000;
+  const remaining = totalMs - (Date.now() - approvedTime);
+  if (remaining <= 0) return { expired: true, pct: 0, text: 'Expired from public map' };
+  const pct = Math.max(2, Math.min(100, (remaining / totalMs) * 100));
+  const hrs = Math.floor(remaining / 3600000);
+  const mins = Math.floor((remaining % 3600000) / 60000);
+  return { expired: false, pct, text: `${hrs}h ${mins}m remaining` };
+}
+
+function renderIncidentPopup(i, isOfficialOrAdmin) {
+  const sm  = incStatusMeta(i.status);
+  const vis = incVisibilityInfo(i);
+  const isPending = i.approved != 1;
+  const pendingBanner = isPending ? `<div class="inc-pop-pending">⏳ PENDING APPROVAL</div>` : '';
+  const visBar = (!isPending && vis) ? `
+    <div class="inc-pop-vis">
+      <div class="inc-pop-vis-row"><span>PUBLIC VISIBILITY</span><span>${vis.text}</span></div>
+      <div class="inc-pop-vis-track"><div class="inc-pop-vis-fill" style="width:${vis.pct}%;background:${vis.expired?'#aaa':'var(--green)'}"></div></div>
+    </div>` : '';
+  const manageBtn = isOfficialOrAdmin
+    ? `<button class="inc-pop-btn inc-pop-btn-manage" onclick="openIncManage(${i.id})">⚙ Manage</button>` : '';
+  const desc = i.description || '';
+  const reporter = i.reporter_name || i.reporter_fullname || 'Resident';
+  return `
+    <div class="inc-pop">
+      ${pendingBanner}
+      <div class="inc-pop-hd">
+        <div class="inc-pop-icon">${incIcon(i.category)}</div>
+        <div>
+          <div class="inc-pop-title">${incLabel(i.category)}</div>
+          <div class="inc-pop-sub">${i.address ? escH(i.address) : 'Brgy. Cabugao'}</div>
+        </div>
+      </div>
+      <div class="inc-pop-row">📅 ${fmtIncidentDate(i.created_at)}</div>
+      <div class="inc-pop-row">👤 Reported by <b>${escH(reporter)}</b></div>
+      ${desc ? `<div class="inc-pop-quote">“${escH(desc.substring(0,140))}${desc.length>140?'…':''}”</div>` : ''}
+      <div class="inc-pop-status"><span class="inc-pop-pill" style="color:${sm.color};border-color:${sm.color}55;background:${sm.color}14">● ${sm.label}</span></div>
+      ${visBar}
+      <div class="inc-pop-actions">${manageBtn}</div>
+    </div>
+  `;
+}
+
+// Drag & drop CSV
+document.addEventListener('DOMContentLoaded',()=>{
+  const fd=qs('#fileDrop');
+  if(fd){
+    fd.addEventListener('dragover',e=>{e.preventDefault();fd.style.borderColor='#1a6b3a';});
+    fd.addEventListener('dragleave',()=>{fd.style.borderColor='';});
+    fd.addEventListener('drop',e=>{e.preventDefault();fd.style.borderColor='';if(e.dataTransfer.files.length){qs('#csvFile').files=e.dataTransfer.files;handleFile(qs('#csvFile'));}});
+  }
+});
+
+// ===================== INIT =====================
+document.addEventListener('DOMContentLoaded',()=>{
+  initMap();
+  loadStats();
+  checkAuth();
+  loadStreetSidebar();
+  checkForPasswordResetLink();
+});
