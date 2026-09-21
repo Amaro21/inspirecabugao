@@ -175,27 +175,6 @@ function loadSidebarFacilities() {
   });
 }
 
-function loadSidebarIncidents() {
-  const st = qs('#incStatusFilter').value;
-  const u  = currentUser();
-  const isOff = isStaff(u);
-  qs('#incidentList').innerHTML = '<div class="loading-state">Loading...</div>';
-  api(`incidents${st?'&status='+st:''}`).then(incs => {
-    if (!incs.length) { qs('#incidentList').innerHTML = '<div class="empty-state">No incidents.</div>'; return; }
-    qs('#incidentList').innerHTML = incs.map(i => `
-      <div class="inc-item" onclick="${isOff ? `openIncManage(${i.id})` : ''}">
-        <div class="inc-title">${incIcon(i.category)} ${i.title}</div>
-        <div class="inc-meta">
-          <span class="badge sev-${i.urgency}">${i.urgency}</span>
-          <span class="badge st-${i.status}">${i.status}</span>
-          ${i.approved==1
-            ? '<span class="badge" style="background:#e8f5e9;color:#2e7d32;font-size:.65rem">✅ On Map</span>'
-            : '<span class="badge" style="background:#fff3e0;color:#e65100;font-size:.65rem">⏳ Pending</span>'}
-        </div>
-      </div>`).join('');
-  });
-}
-
 function flyFacility(lat,lng) {
   if(lat&&lng) {
     if (isMobileScreen()) closeMobileSidebar();
@@ -282,7 +261,7 @@ function showPage(pg) {
   if(pg==='incidents') { loadIncidentReport(); }
   if(pg==='admin') loadAdminPage();
   // Show/hide report incident buttons — only on the map page, and only for guests
-  const onMap = pg === 'map' && !isOperationalStaff(_user);
+  const onMap = pg === 'map' && !isStaff(_user);
   updateReportButtonVisibility(onMap);
 }
 

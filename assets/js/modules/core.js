@@ -61,13 +61,6 @@ function calcAgeGroup(birthDateStr) {
   return 'adult';
 }
 
-function ageGroupLabel(birthDateStr) {
-  const g = calcAgeGroup(birthDateStr);
-  if (g === 'child')  return '👶 Child';
-  if (g === 'senior') return '👴 Senior Citizen';
-  return '🧑 Adult';
-}
-
 function calcAge(birthDateStr) {
   if (!birthDateStr) return '?';
   const today = new Date();

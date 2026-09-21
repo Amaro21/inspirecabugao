@@ -22,7 +22,6 @@ CREATE TABLE IF NOT EXISTS users (
     full_name VARCHAR(200) NOT NULL,
     role ENUM('super_admin','admin') NOT NULL DEFAULT 'admin',
     email VARCHAR(200),
-    contact VARCHAR(50),
     is_active TINYINT(1) DEFAULT 1,
     reset_token VARCHAR(64) NULL,
     reset_expires DATETIME NULL,
@@ -130,17 +129,6 @@ CREATE TABLE IF NOT EXISTS incidents (
     FOREIGN KEY (reported_by) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (assigned_to) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (approved_by) REFERENCES users(id) ON DELETE SET NULL
-);
-
--- -------------------- IMPORT LOGS --------------------
-CREATE TABLE IF NOT EXISTS import_logs (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    user_id INT,
-    filename VARCHAR(255),
-    rows_imported INT DEFAULT 0,
-    rows_failed INT DEFAULT 0,
-    imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
 );
 
 -- -------------------- ACTIVITY LOGS (full audit trail) --------------------

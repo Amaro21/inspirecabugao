@@ -506,7 +506,6 @@ function openIncManage(id) {
     const i=incs.find(x=>x.id==id);
     if(!i){qs('#incManageBd').innerHTML='<div class="empty-state">Not found.</div>';return;}
     const canManage=isStaff(u);
-    const canDelete=isStaff(u);
     const sm = incStatusMeta(i.status);
     const sev = incUrgencyMeta(i.urgency);
     const subLabel = incSubtypeLabel(i.category, i.subtype);
@@ -559,12 +558,6 @@ function openIncManage(id) {
 function updateIncident(id) {
   apiPost('incident_update',{id,status:qs('#imStatus').value,resolution_notes:qs('#imNotes').value}).then(r=>{
     if(r.success){closeModal('incManageModal');loadMapData();loadIncidentsPage();loadSidebarActiveIncidents();loadStats();toast('Incident updated.');}
-  });
-}
-
-function deleteIncident(id) {
-  showConfirm('Delete this incident report? This cannot be undone.', () => {
-    apiPost('incident_delete',{id}).then(r=>{if(r.success){closeModal('incManageModal');loadMapData();loadIncidentsPage();loadStats();toast('Incident deleted.');}});
   });
 }
 

@@ -348,17 +348,6 @@ function doLogin() {
   });
 }
 
-function doRegister() {
-  const d={full_name:qs('#rName').value.trim(),username:qs('#rUser').value.trim(),password:qs('#rPass').value,contact:qs('#rContact').value.trim()};
-  const e=qs('#regErr');e.style.display='none';
-  if(!d.full_name||!d.username||!d.password){e.textContent='All required fields must be filled.';e.style.display='block';return;}
-  apiPost('register',d).then(r=>{
-    if(r.error){e.textContent=r.error;e.style.display='block';return;}
-    qs('#rName').value='';qs('#rUser').value='';qs('#rPass').value='';qs('#rContact').value='';
-    ltab('login');toast('Registered! Please log in.');
-  });
-}
-
 function doLogout(){
   api('logout').then(()=>{
     _user=null;
@@ -369,11 +358,5 @@ function doLogout(){
     loadStats();
     toast('Logged out.');
   });
-}
-
-function ltab(t) {
-  qsa('.ltab').forEach((b,i)=>b.classList.toggle('active',['login','register'][i]===t));
-  qs('#lt-login').style.display=t==='login'?'':'none';
-  qs('#lt-register').style.display=t==='register'?'':'none';
 }
 

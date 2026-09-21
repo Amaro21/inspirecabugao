@@ -167,18 +167,6 @@ case 'incident_update':
     logActivity('incident_update', "Updated incident #{$d['id']} status to \"{$d['status']}\".", 'incident', (int)$d['id']);
     jsonResponse(['success' => true]);
 
-case 'incident_delete':
-    if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
-    $d = body();
-    $db = getDB();
-    $ist = $db->prepare("SELECT title, category, photo FROM incidents WHERE id = ?");
-    $ist->execute([(int)($d['id'] ?? 0)]);
-    $irow = $ist->fetch();
-    if ($irow && !empty($irow['photo'])) deletePhotoFile($irow['photo']);
-    $db->prepare("DELETE FROM incidents WHERE id = ?")->execute([(int)($d['id'] ?? 0)]);
-    logActivity('incident_delete', "Deleted incident #" . ($d['id'] ?? '?') . ($irow ? " (\"{$irow['title']}\", {$irow['category']})" : "") . ".", 'incident', (int)($d['id'] ?? 0));
-    jsonResponse(['success' => true]);
-
 case 'incidents_pending':
     if (!isOfficial()) jsonResponse(['error' => 'Unauthorized.'], 401);
     $db = getDB();

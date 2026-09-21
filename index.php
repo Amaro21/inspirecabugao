@@ -16,7 +16,7 @@ $showLoginLanding = isset($_GET['admin']) && !isOfficial();
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<link rel="stylesheet" href="assets/css/style.css?v=262">
+<link rel="stylesheet" href="assets/css/style.css?v=267">
 <script src="https://www.google.com/recaptcha/api.js" async defer></script>
 </head>
 <body<?= $showLoginLanding ? ' class="login-landing-active"' : '' ?>>
@@ -995,19 +995,19 @@ $showLoginLanding = isset($_GET['admin']) && !isOfficial();
 <!-- App logic split into focused modules (see assets/js/modules/) instead
      of one monolithic app.js. Plain <script> tags — no bundler needed —
      loaded in dependency order: core/shared helpers first, page-init last. -->
-<script src="assets/js/modules/core.js?v=262"></script>
-<script src="assets/js/modules/pinmaps.js?v=262"></script>
-<script src="assets/js/modules/mapview.js?v=262"></script>
-<script src="assets/js/modules/navigation.js?v=262"></script>
-<script src="assets/js/modules/population.js?v=262"></script>
-<script src="assets/js/modules/facilities.js?v=262"></script>
-<script src="assets/js/modules/incidents.js?v=262"></script>
-<script src="assets/js/modules/admindash.js?v=262"></script>
-<script src="assets/js/modules/admingeo.js?v=262"></script>
-<script src="assets/js/modules/adminusers.js?v=262"></script>
-<script src="assets/js/modules/notifications.js?v=262"></script>
-<script src="assets/js/modules/auth.js?v=262"></script>
-<script src="assets/js/modules/init.js?v=262"></script>
+<script src="assets/js/modules/core.js?v=267"></script>
+<script src="assets/js/modules/pinmaps.js?v=267"></script>
+<script src="assets/js/modules/mapview.js?v=267"></script>
+<script src="assets/js/modules/navigation.js?v=267"></script>
+<script src="assets/js/modules/population.js?v=267"></script>
+<script src="assets/js/modules/facilities.js?v=267"></script>
+<script src="assets/js/modules/incidents.js?v=267"></script>
+<script src="assets/js/modules/admindash.js?v=267"></script>
+<script src="assets/js/modules/admingeo.js?v=267"></script>
+<script src="assets/js/modules/adminusers.js?v=267"></script>
+<script src="assets/js/modules/notifications.js?v=267"></script>
+<script src="assets/js/modules/auth.js?v=267"></script>
+<script src="assets/js/modules/init.js?v=267"></script>
 <script>
 // Override checkAuth to control admin-only nav tabs
 const _origCheckAuth = typeof checkAuth === 'function' ? checkAuth : null;

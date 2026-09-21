@@ -94,8 +94,6 @@ function playAlertSound(urgent) {
     });
   } catch (e) { /* audio not supported, fail silently */ }
 }
-// Backward-compatible alias
-function playNotifSound() { playAlertSound(true); }
 
 function showIncidentNotif(incs) {
   playAlertBursts(3); // 3 bursts like a phone notification

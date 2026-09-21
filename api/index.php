@@ -81,7 +81,6 @@ $routes = [
     'incident_report'     => 'incidents',
     'check_report_status' => 'incidents',
     'incident_update'     => 'incidents',
-    'incident_delete'     => 'incidents',
     'incidents_pending'   => 'incidents',
     'incident_approve'    => 'incidents',
     'incident_reject'     => 'incidents',

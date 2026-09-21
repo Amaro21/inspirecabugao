@@ -8,7 +8,7 @@ switch ($action) {
 case 'users':
     if (!isAdmin()) jsonResponse(['error' => 'Unauthorized — Super Admin only.'], 401);
     $db = getDB();
-    jsonResponse($db->query("SELECT id, username, full_name, role, email, contact, is_active, created_at FROM users ORDER BY role, full_name")->fetchAll());
+    jsonResponse($db->query("SELECT id, username, full_name, role, email, is_active, created_at FROM users ORDER BY role, full_name")->fetchAll());
 
 case 'user_create':
     if (!isAdmin()) jsonResponse(['error' => 'Unauthorized — Super Admin only.'], 401);

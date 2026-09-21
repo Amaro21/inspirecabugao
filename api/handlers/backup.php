@@ -36,7 +36,7 @@ function generateBackupSql() {
     // table it references existed yet.
     // Forward order: parents before children (for CREATE TABLE — each table's
     // FK references must already exist before it is created).
-    $createOrder = ['streets', 'users', 'puroks', 'houses', 'members', 'facilities', 'incidents', 'import_logs', 'activity_logs'];
+    $createOrder = ['streets', 'users', 'puroks', 'houses', 'members', 'facilities', 'incidents', 'activity_logs'];
     // Reverse order: children before parents (for DROP TABLE — removes the
     // FK references before the tables they point at are dropped, so MySQL
     // never hits a constraint violation regardless of FOREIGN_KEY_CHECKS).

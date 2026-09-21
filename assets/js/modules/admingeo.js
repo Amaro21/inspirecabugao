@@ -310,19 +310,6 @@ function loadAllStreets(streetSelId) {
   });
 }
 
-function loadAllPuroks(purokSelId) {
-  api('puroks').then(puroks => {
-    const sel = qs('#' + purokSelId);
-    if (!sel) return;
-    if (!puroks.length) {
-      sel.innerHTML = '<option value="">No puroks yet — add one in Admin</option>';
-      return;
-    }
-    sel.innerHTML = '<option value="">Select purok...</option>' +
-      puroks.map(p => `<option value="${p.id}" data-street="${p.street_id}">${p.name}</option>`).join('');
-  });
-}
-
 // Loads puroks belonging to a specific street into a <select>, optionally pre-selecting one
 function loadPuroksForStreet(streetId, purokSelId, preselectId) {
   const sel = qs('#' + purokSelId);
